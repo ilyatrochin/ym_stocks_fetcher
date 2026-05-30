@@ -1,0 +1,24 @@
+[Unit]
+Description=YM Stocks Fetcher — monthly history backfill from Reports API
+Documentation=file:///opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/ym_monthly_history.sh
+
+TimeoutStartSec=1200
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ym-monthly
+
+User=root
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/openclaw /var/log /tmp
+PrivateTmp=true
+
+[Install]

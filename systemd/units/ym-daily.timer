@@ -1,0 +1,20 @@
+[Unit]
+Description=YM Stocks Fetcher — daily timer (08:00)
+Documentation=file:///opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/README.md
+
+[Timer]
+# Каждый день в 08:00 серверного времени
+OnCalendar=*-*-* 08:00:00
+
+# Если систему перезагрузили или таймер пропустил время — запустить
+# сразу при следующем старте
+Persistent=true
+
+# Случайная задержка ±5 минут, чтобы не нагружать API в пиковую секунду
+RandomizedDelaySec=300
+
+# Привязка к сервису
+Unit=ym-daily.service
+
+[Install]
+WantedBy=timers.target
