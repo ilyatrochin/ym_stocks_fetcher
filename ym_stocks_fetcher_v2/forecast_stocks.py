@@ -409,104 +409,145 @@ def build_forecast(
 ) -> list[ForecastRow]:
     """Считает прогноз для каждой строки stock_marketplace.
 
-    Формула days_to_oos:
-        days = (qty_full + ready_office + qty_in_transit) / speed_used
+    Модель: пропорциональное распределение скорости по складам.
 
-    Это плоский прогноз — он отвечает «хватит ли всего наличного и
-    идущего, и на сколько дней». Это компромисс: он НЕ учитывает,
-    что поставка приедет не сегодня. Точная временная модель
-    («остаток упадёт до 0 через 8 дней, но 12-го приедет N штук»)
-    будет в отдельном расширении прогноза.
+    Скорость продаж в sales_daily агрегирована по SKU (Яндекс не
+    отдаёт склад в API заказов), но остатки разнесены по складам.
+    Чтобы сопоставимо посчитать «когда опустеет конкретный склад»,
+    общая скорость SKU делится между складами пропорционально доле
+    остатков:
 
-    Поведение при отсутствии данных:
-    - office_ready = 0, если stock_office нет;
-    - supplies_in_transit = 0, если supplies_planned нет / 0 в пути.
+        share_warehouse  = qty_warehouse / total_qty_sku
+        speed_warehouse  = total_speed_sku * share_warehouse
+        days_to_oos[wh]  = qty_warehouse / speed_warehouse
+                         = total_qty_sku / total_speed_sku
+
+    Математическое следствие: days_to_oos одинаковы для всех складов
+    SKU. Это правильное поведение модели: «если каждый склад продаёт
+    долю спроса, равную его доле в запасе, то все они опустеют
+    одновременно». В TG-сводке это означает одну строку на SKU
+    (а не N строк по числу складов).
+
+    Учитываемые компоненты в формуле:
+        days_to_oos = (Σ qty_full + ready_office + qty_in_transit) / speed
+    То есть берётся полный запас SKU (на всех складах МП + офис +
+    в пути), не только qty_warehouse. Это согласуется с предыдущим
+    поведением «плоского прогноза», но теперь логически корректнее:
+    разные склады SKU не считают по разным скоростям.
+
+    Граничные случаи:
+    - SKU есть на складах, но total_qty_sku=0 (всё распродано):
+        days_to_oos = 0 + transit учитывается, если transit > 0
+    - Скорость speed_used < 0.01 (нет продаж за период):
+        days_to_oos = "нет продаж" для всех складов
 
     Фильтр по routing (warehouse_routing — это whitelist!):
     - Если routing задан и непуст:
         * SKU есть в routing → оставляем ТОЛЬКО снапшоты на разрешённых
           складах для этого SKU.
-        * SKU нет в routing → ПОЛНОСТЬЮ игнорируем все его строки
-          (как будто SKU нет ни в stock_marketplace, ни в supplies).
+        * SKU нет в routing → ПОЛНОСТЬЮ игнорируем все его строки.
     - routing = None → фильтр выключен, идёт всё.
     - routing = {} → фильтр включён, но пуст → ничего не пройдёт
-      (логируем предупреждение, потому что это похоже на пустой
-      лист warehouse_routing — обычно симптом ошибки конфигурации).
+      (логируем warning).
     """
     rows: list[ForecastRow] = []
     today_str = today.isoformat()
-    filtered_pairs = 0           # отброшенные по причине "склад не в routing"
-    skipped_skus_total = 0       # уникальные SKU, отброшенные за "нет в routing"
+    filtered_pairs = 0
     skipped_skus_set: set[str] = set()
 
     routing_enabled = routing is not None
-
     if routing_enabled and not routing:
         logging.warning(
             "routing is empty — все SKU будут отброшены. "
             "Если это не намеренно — проверь лист warehouse_routing")
 
+    # ── Шаг 1: фильтрация по routing + группировка по SKU ────────────
+    snapshots_by_sku: dict[tuple[str, str], list[StockSnapshot]] = defaultdict(list)
     for snap in snapshots:
         if routing_enabled:
             allowed = routing.get(snap.sku)
             if allowed is None:
-                # SKU не упоминается в routing → игнорируем целиком
                 skipped_skus_set.add(snap.sku)
                 continue
-            # Сравнение имени склада регистро- и пробело-нечувствительное
             if snap.warehouse_name.strip().lower() not in allowed:
                 filtered_pairs += 1
                 continue
+        snapshots_by_sku[(snap.sku, snap.marketplace)].append(snap)
 
-        speeds = compute_speeds(sales, today, snap.sku, snap.marketplace)
+    # ── Шаг 2: для каждого SKU считаем агрегаты и раскидываем ────────
+    for (sku, marketplace), snaps in snapshots_by_sku.items():
+        speeds = compute_speeds(sales, today, sku, marketplace)
         speed_used = speeds[SPEED_USED_HORIZON]
-        ready = office_ready.get((snap.sku, snap.marketplace), 0)
 
-        transit_info = supplies_in_transit.get((snap.sku, snap.marketplace),
+        ready = office_ready.get((sku, marketplace), 0)
+        transit_info = supplies_in_transit.get((sku, marketplace),
                                                {"qty": 0, "eta": ""})
         in_transit = transit_info["qty"]
         eta = transit_info["eta"]
 
-        # Защита от inf: используем явный минимальный порог скорости, а не >0.
-        # При speed_used < 0.01 (меньше 1 продажи в 100 дней) считаем "нет продаж".
-        if speed_used >= 0.01:
-            raw_days = (snap.qty_full + ready + in_transit) / speed_used
-            # Дополнительная защита от переполнения
-            days = int(round(raw_days)) if raw_days < 10000 else 9999
+        # Суммарный остаток SKU на всех его активных складах
+        total_qty_sku = sum(s.qty_full for s in snaps)
+        # Полный запас: МП + офис + в пути
+        total_supply = total_qty_sku + ready + in_transit
+
+        # days_to_oos — единый для всех складов SKU (пропорциональная
+        # модель). Граничные случаи:
+        # - speed_used < 0.01 → "нет продаж"
+        # - total_supply == 0 → 0 дней (уже OOS)
+        if speed_used < 0.01:
+            sku_days: int | str = "нет продаж"
+        elif total_supply == 0:
+            sku_days = 0
         else:
-            days = "нет продаж"
+            raw_days = total_supply / speed_used
+            sku_days = int(round(raw_days)) if raw_days < 10000 else 9999
 
-        prio = priority(days if isinstance(days, int) else None)
-        # При расчёте рекомендации к заказу — НЕ вычитаем in_transit:
-        # это уже едет, но мы не управляем им. recommend_qty показывает
-        # сколько НАМ нужно добрать сверх того что мы сами загружаем
-        # (то что в офисе) и того что уже в МП.
-        # in_transit вычитаем дополнительно, иначе будем заказывать дубль.
-        rec = recommend_qty(snap.qty_full + in_transit, ready, speed_used)
-        check = sanity_check(days, snap.turnover_grade, snap.turnover_days)
-        will_alert = isinstance(days, int) and days < ALERT_THRESHOLD_DAYS
+        # Рекомендация к заказу — по агрегату SKU (а не складу).
+        # Покупаем партию для всего SKU, потом раскладываем по складам.
+        # Из общей потребности вычитаем in_transit, чтобы не дублировать
+        # уже едущий заказ.
+        rec = recommend_qty(total_qty_sku + in_transit, ready, speed_used)
+        check = sanity_check(sku_days, snaps[0].turnover_grade,
+                             snaps[0].turnover_days)
+        prio = priority(sku_days if isinstance(sku_days, int) else None)
+        will_alert = isinstance(sku_days, int) and sku_days < ALERT_THRESHOLD_DAYS
 
-        rows.append(ForecastRow(
-            forecast_date=today_str,
-            sku=snap.sku,
-            marketplace=snap.marketplace,
-            warehouse=snap.warehouse_name,
-            stock_mp=snap.qty_full,
-            ready_office=ready,
-            qty_in_transit=in_transit,
-            nearest_arrival=eta,
-            speed_7d=speeds[7],
-            speed_14d=speeds[14],
-            speed_30d=speeds[30],
-            speed_used=speed_used,
-            days_to_oos=days,
-            priority=prio,
-            ym_turnover_grade=snap.turnover_grade,
-            ym_turnover_days=snap.turnover_days,
-            sanity_check=check,
-            recommended_qty=rec,
-            sent_to_tg="Да" if will_alert else "Нет",
-        ))
+        # ── Шаг 3: пишем строку на каждый склад SKU ─────────────────
+        # В строке forecast-листа фиксируем индивидуальные значения
+        # (qty_full склада, доля скорости), но days_to_oos одинаковый
+        # для всех строк SKU. recommended_qty показываем только в
+        # первой строке (не дублируем — это атрибут SKU, не склада).
+        for i, snap in enumerate(snaps):
+            # Доля склада в общем запасе SKU (для отчётности)
+            if total_qty_sku > 0:
+                share = snap.qty_full / total_qty_sku
+                speed_wh = round(speed_used * share, 2)
+            else:
+                share = 0.0
+                speed_wh = 0.0
+
+            rows.append(ForecastRow(
+                forecast_date=today_str,
+                sku=snap.sku,
+                marketplace=snap.marketplace,
+                warehouse=snap.warehouse_name,
+                stock_mp=snap.qty_full,
+                ready_office=ready if i == 0 else 0,           # только в 1-й строке
+                qty_in_transit=in_transit if i == 0 else 0,    # только в 1-й
+                nearest_arrival=eta if i == 0 else "",
+                speed_7d=speeds[7],
+                speed_14d=speeds[14],
+                speed_30d=speeds[30],
+                speed_used=speed_wh,           # доля скорости этого склада
+                days_to_oos=sku_days,          # ОДИНАКОВ для всех складов SKU
+                priority=prio,
+                ym_turnover_grade=snap.turnover_grade,
+                ym_turnover_days=snap.turnover_days,
+                sanity_check=check,
+                recommended_qty=rec if i == 0 else 0,          # атрибут SKU
+                sent_to_tg="Да" if (will_alert and i == 0) else "Нет",
+            ))
+
     if filtered_pairs or skipped_skus_set:
         logging.info(
             "warehouse_routing: filtered out %d (sku, warehouse) pairs "
@@ -529,70 +570,107 @@ def _transit_hint(r: ForecastRow) -> str:
     return f" 🚚 +{r.qty_in_transit}"
 
 
+def _group_by_sku(rows: list[ForecastRow]) -> dict[str, list[ForecastRow]]:
+    """Группирует строки прогноза по SKU. Внутри SKU — несколько строк
+    (по складам), days_to_oos у всех одинаковый (пропорциональная модель)."""
+    by_sku: dict[str, list[ForecastRow]] = defaultdict(list)
+    for r in rows:
+        by_sku[r.sku].append(r)
+    return by_sku
+
+
+def _sku_summary_one(rows: list[ForecastRow]) -> ForecastRow:
+    """Берёт «представителя» SKU для сводки: первую строку, которая
+    содержит ready_office/in_transit (это i==0 при записи в build_forecast).
+    Все агрегатные значения days_to_oos, recommended_qty, priority,
+    nearest_arrival совпадают у всех складов SKU, можно брать первую."""
+    return rows[0]
+
+
+def _warehouses_breakdown(rows: list[ForecastRow]) -> str:
+    """Возвращает компактный список остатков по складам: 'Софьино 5, Ростов 0'.
+    Сортируется по убыванию остатка — пустые склады в конце."""
+    parts = []
+    for r in sorted(rows, key=lambda x: -x.stock_mp):
+        parts.append(f"{r.warehouse} {r.stock_mp}")
+    return ", ".join(parts)
+
+
 def build_summary(rows: list[ForecastRow], today: date) -> str:
-    critical = [r for r in rows if r.priority == "🔴"]
-    warning = [r for r in rows if r.priority == "🟡"]
-    sanity_issues = [r for r in rows if "⚠️" in r.sanity_check]
-    incoming = [r for r in rows if r.qty_in_transit > 0]
+    """Сводка для Telegram, агрегированная по SKU.
+
+    В пропорциональной модели days_to_oos одинаковый для всех складов
+    SKU, поэтому в TG идёт одна строка на SKU + разбивка по складам
+    (показывает где сейчас сколько лежит).
+    """
+    by_sku = _group_by_sku(rows)
+    # Суммируем по SKU: общий остаток МП, представительская инфа
+    sku_summaries: list[tuple[ForecastRow, list[ForecastRow], int]] = []
+    for sku, sku_rows in by_sku.items():
+        rep = _sku_summary_one(sku_rows)
+        total_mp = sum(r.stock_mp for r in sku_rows)
+        sku_summaries.append((rep, sku_rows, total_mp))
+
+    critical = [s for s in sku_summaries if s[0].priority == "🔴"]
+    warning = [s for s in sku_summaries if s[0].priority == "🟡"]
+    sanity_issues = [s for s in sku_summaries if "⚠️" in s[0].sanity_check]
+    incoming = [s for s in sku_summaries if s[0].qty_in_transit > 0]
+    in_norm = [s for s in sku_summaries if s[0].priority == "🟢"]
 
     lines = [f"☀️ <b>Прогноз остатков YM на {today.isoformat()}</b>", ""]
 
+    def _key_days(s):
+        d = s[0].days_to_oos
+        return d if isinstance(d, int) else 999
+
     if critical:
-        lines.append(f"🔴 <b>Срочно (&lt; 7 дней до OOS):</b>")
-        for r in sorted(critical, key=lambda x: x.days_to_oos if isinstance(x.days_to_oos, int) else 999):
+        lines.append("🔴 <b>Срочно (&lt; 7 дней до OOS):</b>")
+        for rep, sku_rows, total_mp in sorted(critical, key=_key_days):
+            transit = f" 🚚 +{rep.qty_in_transit}" if rep.qty_in_transit > 0 else ""
+            breakdown = _warehouses_breakdown(sku_rows)
             lines.append(
-                f"• {r.sku} / {r.warehouse}: остаток {r.stock_mp}, "
-                f"скорость {r.speed_used:.1f}/день → ~{r.days_to_oos} дней. "
-                f"Рекомендую {r.recommended_qty} шт.{_transit_hint(r)}"
+                f"• <b>{rep.sku}</b>: остаток {total_mp} шт, "
+                f"скорость {rep.speed_30d:.2f}/день → ~{rep.days_to_oos} дней. "
+                f"Рекомендую <b>{rep.recommended_qty} шт</b>.{transit}"
             )
+            lines.append(f"   склады: {breakdown}")
         lines.append("")
 
     if warning:
-        lines.append(f"🟡 <b>Скоро (7-14 дней):</b>")
-        for r in sorted(warning, key=lambda x: x.days_to_oos if isinstance(x.days_to_oos, int) else 999):
+        lines.append("🟡 <b>Скоро (7-14 дней):</b>")
+        for rep, sku_rows, total_mp in sorted(warning, key=_key_days):
+            transit = f" 🚚 +{rep.qty_in_transit}" if rep.qty_in_transit > 0 else ""
+            breakdown = _warehouses_breakdown(sku_rows)
             lines.append(
-                f"• {r.sku} / {r.warehouse}: {r.stock_mp} шт, "
-                f"~{r.days_to_oos} дней. Рекомендую {r.recommended_qty}.{_transit_hint(r)}"
+                f"• <b>{rep.sku}</b>: {total_mp} шт, ~{rep.days_to_oos} дней. "
+                f"Рекомендую <b>{rep.recommended_qty} шт</b>.{transit}"
             )
+            lines.append(f"   склады: {breakdown}")
         lines.append("")
 
     if sanity_issues:
-        lines.append(f"⚠️ <b>Расхождения с оценкой Яндекса:</b>")
-        for r in sanity_issues:
+        lines.append("⚠️ <b>Расхождения с оценкой Яндекса:</b>")
+        for rep, sku_rows, total_mp in sanity_issues:
             lines.append(
-                f"• {r.sku} / {r.warehouse}: наш прогноз {r.days_to_oos} дн, "
-                f"YM={r.ym_turnover_grade} ({r.ym_turnover_days} дн)"
+                f"• <b>{rep.sku}</b>: наш прогноз {rep.days_to_oos} дн, "
+                f"YM={rep.ym_turnover_grade} ({rep.ym_turnover_days} дн)"
             )
         lines.append("")
 
-    # Отдельная сводка по идущим поставкам — показываем даже там, где
-    # прогноз 🟢, чтобы было видно "движение".
-    # Дедуплицируем: одна строка supplies_planned может соответствовать
-    # нескольким строкам forecast (одному SKU — несколько складов).
-    # Берём по одной записи на SKU: qty_in_transit и eta у дублей
-    # одинаковые (берутся из той же agg-записи), так что выбор любой.
+    # Поставки в пути — по SKU (как раньше, но через сводку sku_summaries)
     if incoming:
-        by_sku: dict[str, ForecastRow] = {}
-        for r in incoming:
-            # max() оставит "первый встреченный" — детерминированно
-            if r.sku not in by_sku:
-                by_sku[r.sku] = r
-        unique_incoming = list(by_sku.values())
-
-        lines.append(f"🚚 <b>В пути на склады YM ({len(unique_incoming)} SKU):</b>")
-        # Сортируем по nearest_arrival (пустые даты в конец)
-        def _eta_key(x):
-            return x.nearest_arrival or "9999-99-99"
-        for r in sorted(unique_incoming, key=_eta_key)[:15]:
-            eta = r.nearest_arrival or "дата не указана"
-            lines.append(f"• {r.sku}: +{r.qty_in_transit} шт (≈{eta})")
-        if len(unique_incoming) > 15:
-            lines.append(f"  …и ещё {len(unique_incoming) - 15} SKU")
+        lines.append(f"🚚 <b>В пути на склады YM ({len(incoming)} SKU):</b>")
+        def _eta_key(s):
+            return s[0].nearest_arrival or "9999-99-99"
+        for rep, sku_rows, total_mp in sorted(incoming, key=_eta_key)[:15]:
+            eta = rep.nearest_arrival or "дата не указана"
+            lines.append(f"• {rep.sku}: +{rep.qty_in_transit} шт (≈{eta})")
+        if len(incoming) > 15:
+            lines.append(f"  …и ещё {len(incoming) - 15} SKU")
         lines.append("")
 
-    in_norm = [r for r in rows if r.priority == "🟢"]
     if in_norm:
-        lines.append(f"🟢 <b>В норме:</b> {len(in_norm)} позиций")
+        lines.append(f"🟢 <b>В норме:</b> {len(in_norm)} SKU")
 
     return "\n".join(lines)
 
