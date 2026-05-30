@@ -399,6 +399,32 @@ def recommend_qty(stock_mp: int, ready_office: int, speed: float) -> int:
     return max(int(round(deficit)), 0)
 
 
+def _restore_warehouse_name_case(name_lower: str,
+                                 known_snaps: list,
+                                 global_cache: dict | None = None) -> str:
+    """Возвращает имя склада в исходном регистре.
+
+    Поиск в порядке:
+    1. global_cache — если склад встречался у других SKU в snapshots, его
+       красивое имя там уже сохранено.
+    2. known_snaps — снапшоты текущего SKU (на случай если кэш не передан).
+    3. capitalize() от routing-имени — крайний fallback.
+
+    Зачем: routing хранит имена в lowercase (для регистро-нечувствительного
+    сравнения), а в TG-сводке хочется видеть "Софьино", а не "софьино".
+    """
+    if global_cache is not None and name_lower in global_cache:
+        return global_cache[name_lower]
+    for s in known_snaps:
+        if s.warehouse_name.strip().lower() == name_lower:
+            return s.warehouse_name
+    # Capitalize не идеален для "ЛО Шушары" — даст "Ло шушары".
+    # Но routing-имя приходит в lowercase из-за strip().lower() при чтении,
+    # так что оригинальный регистр всё равно потерян. Лучше так, чем "софьино".
+    return name_lower.title()
+
+
+
 def build_forecast(
     snapshots: list[StockSnapshot],
     sales: list[SalesPoint],
@@ -461,6 +487,17 @@ def build_forecast(
             "routing is empty — все SKU будут отброшены. "
             "Если это не намеренно — проверь лист warehouse_routing")
 
+    # Глобальный кэш имён складов: lowercase → original case.
+    # Заполняем со ВСЕХ snapshots до фильтрации, чтобы при добавлении
+    # фиктивных нулевых складов знать как красиво отобразить имя
+    # (даже если у текущего SKU склад нигде не встречается с qty > 0,
+    # но у других SKU встречается).
+    warehouse_name_cache: dict[str, str] = {}
+    for s in snapshots:
+        key = s.warehouse_name.strip().lower()
+        if key and key not in warehouse_name_cache:
+            warehouse_name_cache[key] = s.warehouse_name
+
     # ── Шаг 1: фильтрация по routing + группировка по SKU ────────────
     snapshots_by_sku: dict[tuple[str, str], list[StockSnapshot]] = defaultdict(list)
     for snap in snapshots:
@@ -489,6 +526,45 @@ def build_forecast(
         total_qty_sku = sum(s.qty_full for s in snaps)
         # Полный запас: МП + офис + в пути
         total_supply = total_qty_sku + ready + in_transit
+
+        # ── Дополняем "отсутствующие" склады из routing ──────────────
+        # Если в routing для SKU указан склад, но в stock_marketplace
+        # снапшота на него нет (Яндекс не вернул строку — обычно при
+        # FIT=0), создаём фиктивный StockSnapshot с qty_full=0.
+        #
+        # Это влияет ТОЛЬКО на отображение: на расчёт total_qty_sku,
+        # days_to_oos и recommended_qty фиктивные нули не влияют
+        # (мы их добавляем ПОСЛЕ агрегации).
+        #
+        # Зачем: закупщик должен видеть "Софьино 0, Ростов 0" наглядно
+        # — иначе сводка показывает только Екатеринбург 3, и кажется,
+        # что заказ из 5 штук некуда раскидывать.
+        if routing_enabled and routing and sku in routing:
+            present_warehouses_lower = {
+                s.warehouse_name.strip().lower() for s in snaps
+            }
+            expected_warehouses = routing[sku]
+            for wh_lower in sorted(expected_warehouses):
+                if wh_lower in present_warehouses_lower:
+                    continue
+                # Имя из routing — в нижнем регистре. Для отображения
+                # делаем title case, лучшего источника красивого имени
+                # у нас нет (mp_warehouses можно подтянуть, но это
+                # лишний запрос; для редкого случая нулевых складов
+                # сойдёт).
+                display_name = _restore_warehouse_name_case(
+                    wh_lower, snaps, warehouse_name_cache)
+                fake_snap = StockSnapshot(
+                    date=snaps[0].date,
+                    sku=sku,
+                    marketplace=marketplace,
+                    warehouse_id=0,           # неизвестен — Яндекс не вернул
+                    warehouse_name=display_name,
+                    qty_full=0,
+                    turnover_grade=snaps[0].turnover_grade,
+                    turnover_days=snaps[0].turnover_days,
+                )
+                snaps.append(fake_snap)
 
         # days_to_oos — единый для всех складов SKU (пропорциональная
         # модель). Граничные случаи:
