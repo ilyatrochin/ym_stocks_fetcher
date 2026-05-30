@@ -1,0 +1,78 @@
+name: Deploy to production
+
+# Когда запускать
+on:
+  # Кнопка "Run workflow" в GitHub UI с выбором версии
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Что катить (main, develop, v0.4.0)'
+        required: true
+        default: 'main'
+        type: string
+
+  # Автоматический деплой при push в main или новом теге
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+
+# Чтобы два деплоя не запустились одновременно
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Определить целевую версию
+        id: target
+        run: |
+          # Если запущено вручную — берём input. Если push tag — имя тега.
+          # Если push в main — берём main.
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "ref=${{ inputs.target }}" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "ref=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Установить SSH ключ и known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Деплой
+        id: deploy
+        run: |
+          ssh -i ~/.ssh/deploy_key \
+              "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              "bash /opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/deploy.sh ${{ steps.target.outputs.ref }}"
+
+      - name: Telegram-уведомление об успехе
+        if: success()
+        run: |
+          curl -sS -o /dev/null \
+            "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            -d "parse_mode=HTML" \
+            -d "text= Deploy на прод: <code>${{ steps.target.outputs.ref }}</code>%0AЗапустил: ${{ github.actor }}"
+        # Шаг не обязательный — если нет TG_BOT_TOKEN, просто пропусти
+
+      - name: Telegram-уведомление об ошибке
+        if: failure()
+        run: |
+          curl -sS -o /dev/null \
+            "https://api.telegram.org/bot${{ secrets.TG_BOT_TOKEN }}/sendMessage" \
+            -d "chat_id=${{ secrets.TG_CHAT_ID }}" \
+            -d "parse_mode=HTML" \
+            -d "text=Deploy упал: <code>${{ steps.target.outputs.ref }}</code>%0Aпосмотри: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
