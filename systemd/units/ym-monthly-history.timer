@@ -1,0 +1,12 @@
+[Unit]
+Description=YM Stocks Fetcher — monthly history timer (5th day at 06:00)
+
+[Timer]
+# 5-го числа каждого месяца в 06:00 (даём YM пару дней закрыть прошлый месяц)
+OnCalendar=*-*-05 06:00:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=ym-monthly-history.service
+
+[Install]
+WantedBy=timers.target

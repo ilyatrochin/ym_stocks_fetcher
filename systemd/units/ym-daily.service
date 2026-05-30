@@ -1,0 +1,30 @@
+[Unit]
+Description=YM Stocks Fetcher — daily pipeline (stocks + orders + forecast)
+Documentation=file:///opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/openclaw/skills/ym_stocks_fetcher_patched/scripts/ym_daily.sh
+
+TimeoutStartSec=600
+
+# Логи через journald
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ym-daily
+
+# Запускаем от root (нужен доступ к /opt/openclaw/secrets)
+# Если хочется ограничить — создайте пользователя и поменяйте User=
+User=root
+
+# Изоляция (необязательно, но не повредит)
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/openclaw /var/log /tmp
+PrivateTmp=true
+
+[Install]
+# Не используется напрямую — запускается таймером
