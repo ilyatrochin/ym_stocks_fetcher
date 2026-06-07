@@ -121,6 +121,31 @@ class PlannedRow:
 
 
 @dataclass
+class RequestItemRow:
+    """Строка для supplies_requests: одна заявка × один SKU."""
+    fetch_timestamp: str
+    request_id: int
+    marketplace_request_id: str
+    status: str
+    marketplace: str
+    target_warehouse: str
+    requested_date: str
+    sku: str
+    plan_qty: int
+    fact_qty: int
+    qty_in_transit: int
+
+    def as_list(self) -> list:
+        return [
+            self.fetch_timestamp, self.request_id,
+            self.marketplace_request_id, self.status,
+            self.marketplace, self.target_warehouse,
+            self.requested_date, self.sku,
+            self.plan_qty, self.fact_qty, self.qty_in_transit,
+        ]
+
+
+@dataclass
 class FetchResult:
     success: bool = False
     total_requests_seen: int = 0
@@ -276,12 +301,14 @@ def iter_active_supplies(client: YMSuppliesClient) -> Iterator[SupplyRequest]:
         yield parsed
 
 
-def aggregate(client: YMSuppliesClient,
-              fetch_ts: str) -> tuple[list[PlannedRow], FetchResult]:
+def aggregate(
+    client: YMSuppliesClient, fetch_ts: str,
+) -> tuple[list[PlannedRow], list[RequestItemRow], FetchResult]:
     """Собирает все активные заявки, тянет товары в каждой, агрегирует
-    по SKU. Возвращает (rows, result)."""
+    по SKU. Возвращает (planned_rows, request_item_rows, result)."""
 
     result = FetchResult()
+    request_item_rows: list[RequestItemRow] = []
     # ключ: sku → накопленные данные
     agg: dict[str, dict] = defaultdict(lambda: {
         "qty_in_transit": 0,
@@ -314,6 +341,21 @@ def aggregate(client: YMSuppliesClient,
             # "В пути" = запланировано минус уже принято.
             # Если plan < fact (избыток на приёмке) — не вычитаем в минус.
             in_transit = max(plan - fact, 0)
+
+            # Собираем детализацию по каждой заявке+SKU для бота
+            request_item_rows.append(RequestItemRow(
+                fetch_timestamp=fetch_ts,
+                request_id=req.request_id,
+                marketplace_request_id=req.marketplace_request_id,
+                status=req.status,
+                marketplace=MARKETPLACE,
+                target_warehouse=req.target_warehouse_name,
+                requested_date=req.requested_date,
+                sku=sku,
+                plan_qty=plan,
+                fact_qty=fact,
+                qty_in_transit=in_transit,
+            ))
 
             a = agg[sku]
             a["qty_in_transit"] += in_transit
@@ -365,7 +407,7 @@ def aggregate(client: YMSuppliesClient,
 
     result.skus_in_transit = sum(1 for r in rows if r.qty_in_transit > 0)
     result.total_qty_in_transit = total_qty
-    return rows, result
+    return rows, request_item_rows, result
 
 
 # ----------------------------------------------------------------------
@@ -376,6 +418,12 @@ class SheetsClient:
     # 1-3 строки intro + 1 заголовок + данные.
     HEADER_MARKER = "fetch_timestamp"
     SHEET_NAME = "supplies_planned"
+    REQUESTS_SHEET = "supplies_requests"
+    REQUESTS_HEADERS = [
+        "fetch_timestamp", "request_id", "marketplace_request_id",
+        "status", "marketplace", "target_warehouse", "requested_date",
+        "sku", "plan_qty", "fact_qty", "qty_in_transit",
+    ]
 
     def __init__(self, credentials_path: str, spreadsheet_id: str):
         scope = ["https://spreadsheets.google.com/feeds",
@@ -439,6 +487,48 @@ class SheetsClient:
             written = safe_append_rows(ws, [r.as_list() for r in rows])
             logging.info("Wrote %d planned rows", written)
 
+    def replace_requests(self, rows: list[RequestItemRow]):
+        """Полностью переписывает supplies_requests текущим срезом.
+        Создаёт лист при первом запуске."""
+        try:
+            ws = self.spreadsheet.worksheet(self.REQUESTS_SHEET)
+        except gspread.exceptions.WorksheetNotFound:
+            logging.info("Creating sheet '%s'", self.REQUESTS_SHEET)
+            ws = self.spreadsheet.add_worksheet(
+                title=self.REQUESTS_SHEET, rows=1000, cols=11)
+            safe_append_rows(ws, [
+                ["supplies_requests — детализация поставок (заявка × SKU). "
+                 "Переписывается fetch_ym_supplies.py. "
+                 "Читается tg_supplies_bot.py."],
+                [],
+                self.REQUESTS_HEADERS,
+            ])
+
+        # Найти строку заголовка
+        all_values = ws.get_all_values()
+        header_row_idx = None
+        for i, row in enumerate(all_values):
+            if row and row[0].strip().lower() == self.HEADER_MARKER:
+                header_row_idx = i + 1  # 1-indexed
+                break
+
+        if header_row_idx is None:
+            safe_append_rows(ws, [self.REQUESTS_HEADERS])
+            all_values = ws.get_all_values()
+            header_row_idx = len(all_values)
+
+        # Удалить все строки данных после заголовка
+        to_delete = list(range(header_row_idx + 1, len(all_values) + 1))
+        if to_delete:
+            batch_delete_rows(ws, to_delete)
+            logging.info("Removed %d stale rows from %s",
+                         len(to_delete), self.REQUESTS_SHEET)
+
+        if rows:
+            written = safe_append_rows(ws, [r.as_list() for r in rows])
+            logging.info("Wrote %d request-item rows to %s",
+                         written, self.REQUESTS_SHEET)
+
 
 # ----------------------------------------------------------------------
 # Telegram
@@ -488,7 +578,7 @@ def run(dry_run: bool = False) -> FetchResult:
                                     "/opt/openclaw/secrets/gcp-sa.json")
 
         client = YMSuppliesClient(api_key, campaign_id)
-        rows, agg_result = aggregate(client, fetch_ts)
+        rows, request_rows, agg_result = aggregate(client, fetch_ts)
         # Сливаем метрики
         result.total_requests_seen = agg_result.total_requests_seen
         result.active_requests = agg_result.active_requests
@@ -496,12 +586,16 @@ def run(dry_run: bool = False) -> FetchResult:
         result.total_qty_in_transit = agg_result.total_qty_in_transit
 
         if dry_run:
-            logging.info("DRY RUN: %d planned rows", len(rows))
+            logging.info("DRY RUN: %d planned rows, %d request-item rows",
+                         len(rows), len(request_rows))
             for r in rows[:10]:
-                logging.info("  %s", r.as_list())
+                logging.info("  planned: %s", r.as_list())
+            for r in request_rows[:10]:
+                logging.info("  request: %s", r.as_list())
         else:
             sheets = SheetsClient(creds_path, sheet_id)
             sheets.replace_all(rows)
+            sheets.replace_requests(request_rows)
 
         result.success = True
 
