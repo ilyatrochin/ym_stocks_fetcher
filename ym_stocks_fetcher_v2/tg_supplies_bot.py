@@ -242,14 +242,19 @@ def build_report(
     in_transit.sort(key=key_eta)
     planned.sort(key=key_eta)
 
-    lines = [f"📦 <b>Поставки YM на {today}</b>", ""]
+    DIVIDER = "─" * 28
+
+    lines = [f"📦 <b>Поставки YM на {today}</b>"]
     keyboard: list[list[InlineKeyboardButton]] = []
 
     # ── В пути ────────────────────────────────────────────────────────────
     if in_transit:
         n = len(in_transit)
         word = _pluralize(n, "заявка", "заявки", "заявок")
-        lines.append(f"🚚 <b>В пути — {n} {word}:</b>")
+        lines.append("")
+        lines.append(DIVIDER)
+        lines.append(f"🚚 <b>В пути — {n} {word}</b>")
+        lines.append(DIVIDER)
         for req_id, req in in_transit:
             total = sum(i["qty_in_transit"] for i in req["items"])
             items_str = _items_summary(req["items"], "qty_in_transit")
@@ -257,17 +262,19 @@ def build_report(
             mp_id = req["marketplace_request_id"] or str(req_id)
             status_label = req["status"].replace("_", " ").title()
             lines.append(
-                f"• <b>#{mp_id}</b> [{status_label}] → "
-                f"{req['target_warehouse']} (≈{eta})\n"
+                f"• <b>#{mp_id}</b> [{status_label}]\n"
+                f"  📍 {req['target_warehouse']} (≈{eta})\n"
                 f"  {items_str} — итого <b>{total} шт</b>"
             )
-        lines.append("")
 
     # ── Запланированы ─────────────────────────────────────────────────────
     if planned:
         n = len(planned)
         word = _pluralize(n, "заявка", "заявки", "заявок")
-        lines.append(f"📋 <b>Запланированы — {n} {word}:</b>")
+        lines.append("")
+        lines.append(DIVIDER)
+        lines.append(f"📋 <b>Запланированы — {n} {word}</b>")
+        lines.append(DIVIDER)
         for req_id, req in planned:
             total = sum(i["plan_qty"] for i in req["items"])
             items_str = _items_summary(req["items"], "plan_qty")
@@ -296,9 +303,9 @@ def build_report(
                     f"📦 #{mp_id} — упаковать",
                     callback_data=f"pack:{req_id}",
                 )])
-        lines.append("")
 
     if not in_transit and not planned:
+        lines.append("")
         lines.append("✅ Нет активных поставок")
 
     text = "\n".join(lines).strip()
