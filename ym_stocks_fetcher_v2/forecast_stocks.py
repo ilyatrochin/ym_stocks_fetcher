@@ -87,6 +87,14 @@ class SalesPoint:
 
 
 @dataclass
+class HistoryPoint:
+    date: date
+    sku: str
+    qty_delivered: int
+    source_month: str
+
+
+@dataclass
 class StockSnapshot:
     date: date
     sku: str
@@ -139,6 +147,7 @@ class SheetsReader:
     SHEET_HEADERS = {
         "stock_marketplace": "date",
         "sales_daily": "date",
+        "sales_history": "date",
         "stock_office": "sku",
         "supplies_planned": "fetch_timestamp",
         "warehouse_routing": "sku",
@@ -240,6 +249,32 @@ class SheetsReader:
                 continue
             qty = _safe_int(row[3])
             points.append(SalesPoint(d, row[1], row[2], qty))
+        return points
+
+    def read_sales_history(self, since: date) -> list[HistoryPoint]:
+        """Читает sales_history (исторические доставки из Reports API).
+
+        Колонки: date, sku, qty_delivered, source_month.
+        Если листа нет — возвращает [] (fetch_ym_report не запускался).
+        """
+        try:
+            headers, rows = self._find_data_rows("sales_history")
+        except gspread.exceptions.WorksheetNotFound:
+            logging.info("sales_history sheet not found — история выключена")
+            return []
+        points = []
+        for row in rows:
+            if len(row) < 3 or not row[0]:
+                continue
+            try:
+                d = datetime.strptime(row[0], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if d < since:
+                continue
+            qty = _safe_int(row[2])
+            source_month = row[3].strip() if len(row) > 3 else ""
+            points.append(HistoryPoint(d, row[1].strip(), qty, source_month))
         return points
 
     def read_latest_stocks(self, marketplace: str = "YM") -> list[StockSnapshot]:
@@ -377,6 +412,38 @@ def compute_speeds(
     return speeds
 
 
+def compute_history_speed(
+    history: list[HistoryPoint],
+    today: date,
+    sku: str,
+    lookback: int = 90,
+) -> float:
+    """Средняя дневная скорость SKU за исторический период (qty_delivered).
+
+    Делит суммарные продажи на число дней окна (missing days = 0) —
+    консервативная оценка, не завышает скорость из-за пробелов в данных.
+    """
+    by_day: dict[date, int] = defaultdict(int)
+    for p in history:
+        if p.sku == sku:
+            by_day[p.date] += p.qty_delivered
+    start = today - timedelta(days=lookback - 1)
+    total = sum(by_day.get(start + timedelta(days=i), 0) for i in range(lookback))
+    return round(total / lookback, 2)
+
+
+def blend_speeds(current: float, historical: float, weight: float = 0.3) -> float:
+    """Сглаживает текущую скорость историческими данными.
+
+    История может только поднять скорость, но не опустить (max).
+    Если текущих продаж нет, но история есть — берём историю целиком.
+    """
+    if current < 0.01 and historical > 0:
+        return historical
+    blended = current * (1 - weight) + historical * weight
+    return round(max(current, blended), 2)
+
+
 def sanity_check(days_to_oos: int | str, ym_grade: str, ym_days: float | str) -> str:
     if ym_grade == "NO_SALES":
         return "нет продаж"
@@ -432,6 +499,8 @@ def build_forecast(
     supplies_in_transit: dict[tuple[str, str], dict],
     today: date,
     routing: dict[str, set[str]] | None = None,
+    history_speeds: dict[str, float] | None = None,
+    history_weight: float = 0.3,
 ) -> list[ForecastRow]:
     """Считает прогноз для каждой строки stock_marketplace.
 
@@ -515,6 +584,9 @@ def build_forecast(
     for (sku, marketplace), snaps in snapshots_by_sku.items():
         speeds = compute_speeds(sales, today, sku, marketplace)
         speed_used = speeds[SPEED_USED_HORIZON]
+
+        if history_speeds and sku in history_speeds:
+            speed_used = blend_speeds(speed_used, history_speeds[sku], history_weight)
 
         ready = office_ready.get((sku, marketplace), 0)
         transit_info = supplies_in_transit.get((sku, marketplace),
@@ -766,7 +838,9 @@ def send_telegram(bot_token: str, chat_id: str, message: str):
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
-def run(today: date | None = None, dry_run: bool = False):
+def run(today: date | None = None, dry_run: bool = False,
+        use_history: bool = True, history_weight: float = 0.3,
+        history_lookback: int = 90):
     today = today or date.today()
     sheet_id = os.environ["GSHEET_ID"]
     creds_path = os.environ.get("GOOGLE_CREDS", "/opt/openclaw/secrets/gcp-sa.json")
@@ -778,6 +852,24 @@ def run(today: date | None = None, dry_run: bool = False):
     supplies = reader.read_supplies_in_transit()
     routing = reader.read_warehouse_routing(marketplace="YM")
 
+    history_speeds: dict[str, float] | None = None
+    if use_history:
+        history = reader.read_sales_history(
+            since=today - timedelta(days=history_lookback))
+        if history:
+            skus = {p.sku for p in history}
+            history_speeds = {
+                sku: compute_history_speed(history, today, sku, history_lookback)
+                for sku in skus
+            }
+            nonzero = sum(1 for v in history_speeds.values() if v > 0)
+            logging.info(
+                "sales_history: %d entries, %d SKUs, %d with speed > 0 "
+                "(lookback=%d days, weight=%.2f)",
+                len(history), len(skus), nonzero, history_lookback, history_weight)
+        else:
+            logging.info("sales_history: no entries in lookback window — history disabled")
+
     logging.info(
         "Loaded %d snapshots, %d sales points, %d office positions, "
         "%d SKUs in transit, %s",
@@ -786,7 +878,9 @@ def run(today: date | None = None, dry_run: bool = False):
          else f"{len(routing)} SKUs in routing"))
 
     rows = build_forecast(snapshots, sales, office, supplies, today,
-                          routing=routing)
+                          routing=routing,
+                          history_speeds=history_speeds,
+                          history_weight=history_weight)
     logging.info("Built %d forecast rows", len(rows))
 
     if dry_run:
@@ -811,6 +905,15 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--date", default=None)
     parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--no-history", action="store_true",
+                        help="Не использовать sales_history при расчёте скоростей")
+    parser.add_argument("--history-weight", type=float, default=0.3,
+                        metavar="W",
+                        help="Вес исторических данных при сглаживании (0.0–1.0, "
+                             "по умолчанию 0.3)")
+    parser.add_argument("--history-lookback", type=int, default=90,
+                        metavar="DAYS",
+                        help="Окно истории в днях (по умолчанию 90)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -820,7 +923,10 @@ def main():
 
     target_date = (datetime.strptime(args.date, "%Y-%m-%d").date()
                    if args.date else date.today())
-    run(today=target_date, dry_run=args.dry_run)
+    run(today=target_date, dry_run=args.dry_run,
+        use_history=not args.no_history,
+        history_weight=args.history_weight,
+        history_lookback=args.history_lookback)
 
 
 if __name__ == "__main__":
