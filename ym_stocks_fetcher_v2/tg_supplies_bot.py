@@ -59,8 +59,8 @@ SUPPLY_REQUESTS_SHEET = "supplies_requests"
 PACKING_SHEET = "supply_packing"
 PACKING_HEADERS = ["request_id", "packed", "packed_at", "tg_user_id", "tg_username"]
 
-# Заявки с этим статусом считаются «запланированными» — ещё не отправлены.
-CREATED_STATUS = "CREATED"
+# Заявки с этими статусами считаются «в пути» — товар физически движется.
+IN_TRANSIT_STATUSES = {"SHIPPED_TO_SERVICE", "SHIPPED_TO_WAREHOUSE"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -235,7 +235,7 @@ def build_report(
     in_transit: list[tuple[int, dict]] = []
     planned: list[tuple[int, dict]] = []
     for req_id, req in requests_data.items():
-        (planned if req["status"] == CREATED_STATUS else in_transit).append(
+        (in_transit if req["status"] in IN_TRANSIT_STATUSES else planned).append(
             (req_id, req))
 
     key_eta = lambda x: x[1]["requested_date"] or "9999-99-99"
@@ -286,9 +286,9 @@ def build_report(
             if is_packed:
                 packed_at = pack_info.get("packed_at", "")
                 lines.append(
-                    f"• <b>#{mp_id}</b> → {req['target_warehouse']} (≈{eta})\n"
+                    f"✅ <b>#{mp_id}</b> → {req['target_warehouse']} (≈{eta})\n"
                     f"  {items_str} — итого <b>{total} шт</b>\n"
-                    f"  ✅ Упаковано {packed_at}"
+                    f"  <i>упаковано {packed_at}</i>"
                 )
                 keyboard.append([InlineKeyboardButton(
                     f"↩️ #{mp_id} — снять отметку",
@@ -296,8 +296,9 @@ def build_report(
                 )])
             else:
                 lines.append(
-                    f"• <b>#{mp_id}</b> → {req['target_warehouse']} (≈{eta})\n"
-                    f"  {items_str} — итого <b>{total} шт</b>"
+                    f"🔲 <b>#{mp_id}</b> → {req['target_warehouse']} (≈{eta})\n"
+                    f"  {items_str} — итого <b>{total} шт</b>\n"
+                    f"  <i>не упаковано</i>"
                 )
                 keyboard.append([InlineKeyboardButton(
                     f"📦 #{mp_id} — упаковать",
