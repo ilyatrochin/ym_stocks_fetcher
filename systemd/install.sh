@@ -34,6 +34,7 @@ install -m 0644 "$SRC_DIR/units/ym-daily.service"            "$DEST_UNITS/"
 install -m 0644 "$SRC_DIR/units/ym-daily.timer"              "$DEST_UNITS/"
 install -m 0644 "$SRC_DIR/units/ym-monthly-history.service"  "$DEST_UNITS/"
 install -m 0644 "$SRC_DIR/units/ym-monthly-history.timer"    "$DEST_UNITS/"
+install -m 0644 "$SRC_DIR/units/ym-supplies-bot.service"     "$DEST_UNITS/"
 echo "  ✅ Done"
 
 # ── 3. systemd reload + enable ────────────────────────────────────────
@@ -48,7 +49,14 @@ echo "→ Starting timers"
 systemctl start ym-daily.timer
 systemctl start ym-monthly-history.timer
 
-# ── 4. Smoke-test (через сам сервис, dry-run-эффект через ручной запуск) ──
+# ── 4. Telegram-бот поставок ──────────────────────────────────────────
+echo "→ Enabling & starting ym-supplies-bot.service"
+systemctl enable ym-supplies-bot.service
+# Перезапускаем если уже был запущен (подхватит новый код)
+systemctl restart ym-supplies-bot.service || systemctl start ym-supplies-bot.service
+echo "  ✅ Done"
+
+# ── 5. Smoke-test (через сам сервис, dry-run-эффект через ручной запуск) ──
 echo
 echo "→ Smoke-test: запуск forecast через ym_manual.sh --dry-run"
 echo "  (это проверит venv, secrets, Sheets — БЕЗ записи и БЕЗ Telegram)"
@@ -63,7 +71,7 @@ else
     echo "    запуск может фейлиться. Проверьте окружение."
 fi
 
-# ── 5. Сводка ─────────────────────────────────────────────────────────
+# ── 6. Сводка ─────────────────────────────────────────────────────────
 echo
 echo "════════════════════════════════════════════════════════════════"
 echo "✅ Установка завершена."

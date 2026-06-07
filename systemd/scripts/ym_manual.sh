@@ -32,9 +32,10 @@ run() {
 }
 
 case "${1:-help}" in
-    stocks)   run fetch_ym_stocks.py "${@:2}" ;;
-    orders)   run fetch_ym_orders.py "${@:2}" ;;
-    forecast) run forecast_stocks.py "${@:2}" ;;
+    stocks)    run fetch_ym_stocks.py "${@:2}" ;;
+    orders)    run fetch_ym_orders.py "${@:2}" ;;
+    supplies)  run fetch_ym_supplies.py "${@:2}" ;;
+    forecast)  run forecast_stocks.py "${@:2}" ;;
     history)
         YEAR="${2:?Usage: ym_manual.sh history YEAR MONTH}"
         MONTH="${3:?Usage: ym_manual.sh history YEAR MONTH}"
@@ -44,6 +45,7 @@ case "${1:-help}" in
     all)
         run fetch_ym_stocks.py
         run fetch_ym_orders.py
+        run fetch_ym_supplies.py
         run forecast_stocks.py
         ;;
     *)
@@ -53,15 +55,16 @@ Usage: $(basename "$0") <command> [args]
 Commands:
   stocks               — fetch_ym_stocks.py
   orders               — fetch_ym_orders.py
+  supplies             — fetch_ym_supplies.py (товары в пути + supplies_requests)
   forecast [args]      — forecast_stocks.py
   history YEAR MONTH   — fetch_ym_report.py (импорт в sales_history)
-  all                  — все три ежедневных шага по очереди
+  all                  — все четыре ежедневных шага по очереди
 
 Для постоянных запусков лучше использовать systemd:
   systemctl start ym-daily.service           # запустить pipeline сейчас
-  systemctl status ym-daily.service          # статус последнего запуска
+  systemctl status ym-supplies-bot.service   # статус бота поставок
+  journalctl -u ym-supplies-bot.service -f  # логи бота
   systemctl list-timers ym-*                 # ближайшие срабатывания
-  journalctl -u ym-daily.service -f          # логи в реальном времени
   journalctl -u ym-daily.service --since today
 EOF
         ;;

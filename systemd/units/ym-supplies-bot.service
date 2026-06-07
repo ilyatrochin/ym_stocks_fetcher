@@ -1,0 +1,20 @@
+[Unit]
+Description=YM Supplies Telegram Bot (/supplies command)
+Documentation=file:///opt/openclaw/skills/ym_stocks_fetcher_patched/ym_stocks_fetcher_v2/tg_supplies_bot.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openclaw
+WorkingDirectory=/opt/openclaw/skills/ym_stocks_fetcher_patched/ym_stocks_fetcher_v2
+EnvironmentFile=/opt/openclaw/secrets/.env
+ExecStart=/opt/openclaw/skills/ym_stocks_fetcher_patched/.venv/bin/python tg_supplies_bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ym-supplies-bot
+
+[Install]
+WantedBy=multi-user.target

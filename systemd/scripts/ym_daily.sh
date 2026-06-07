@@ -27,9 +27,10 @@ step() {
 
 echo "▶ Daily pipeline START at $(date +'%Y-%m-%d %H:%M:%S')"
 
-step "1/3 fetch_ym_stocks"  fetch_ym_stocks.py
-step "2/3 fetch_ym_orders"  fetch_ym_orders.py
-step "3/3 forecast_stocks"  forecast_stocks.py
+step "1/4 fetch_ym_stocks"    fetch_ym_stocks.py
+step "2/4 fetch_ym_orders"    fetch_ym_orders.py
+step "3/4 fetch_ym_supplies"  fetch_ym_supplies.py
+step "4/4 forecast_stocks"    forecast_stocks.py
 
 echo
 echo "✅ Daily pipeline DONE at $(date +'%Y-%m-%d %H:%M:%S')"
