@@ -267,8 +267,8 @@ def parse_request(req: dict) -> SupplyRequest | None:
     return SupplyRequest(
         request_id=int(request_id),
         marketplace_request_id=str(id_obj.get("marketplaceRequestId", "")),
-        status=req.get("status", ""),
-        subtype=req.get("subtype", ""),
+        status=str(req.get("status", "") or "").strip().upper(),
+        subtype=str(req.get("subtype", "") or "").strip().upper(),
         target_warehouse_name=target.get("name", "") or "",
         target_warehouse_id=target.get("serviceId", "") or "",
         requested_date=arrival,
@@ -280,7 +280,8 @@ def parse_request(req: dict) -> SupplyRequest | None:
 def is_active_supply(req: SupplyRequest) -> bool:
     """Фильтр: только активные заявки на поставку (не вывоз/утилизация,
     не отменённые, не завершённые)."""
-    if req.status in EXCLUDED_STATUSES:
+    status = (req.status or "").strip().upper()
+    if status in EXCLUDED_STATUSES:
         return False
     return True  # тип SUPPLY уже отфильтрован отдельно — см. iter_active_supplies
 
@@ -292,7 +293,8 @@ def iter_active_supplies(client: YMSuppliesClient) -> Iterator[SupplyRequest]:
     """Стримит активные заявки типа SUPPLY (применяет оба фильтра)."""
     for raw in client.iter_requests():
         # фильтр по типу — отбрасываем WITHDRAW/UTILIZATION
-        if raw.get("type") not in RELEVANT_TYPES:
+        req_type = str(raw.get("type", "") or "").strip().upper()
+        if req_type not in RELEVANT_TYPES:
             continue
         parsed = parse_request(raw)
         if not parsed:
