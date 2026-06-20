@@ -59,11 +59,12 @@ SUPPLY_REQUESTS_SHEET = "supplies_requests"
 PACKING_SHEET = "supply_packing"
 PACKING_HEADERS = ["request_id", "packed", "packed_at", "tg_user_id", "tg_username"]
 
-# Заявки в статусе CREATED — единственные, к которым относится упаковка
-# (одобрены, но ещё не отгружены из офиса). Всё остальное активное
-# (READY_TO_SHIP, SHIPPED_TO_*, WAREHOUSE_HANDLING и т.п.) — уже едет/обрабатывается
-# складом МП, упаковщику там делать нечего → показываем без кнопок в «В пути».
-PLANNED_STATUSES = {"CREATED"}
+# Заявки, к которым относится этап упаковки в офисе — ещё не отгружены.
+# CREATED — создана, ждёт одобрения. ACCEPTED_BY_WAREHOUSE_SYSTEM —
+# одобрена складской системой МП, ждёт нашей упаковки/отгрузки.
+# Всё остальное активное (SHIPPED_TO_*, WAREHOUSE_HANDLING и т.п.) — уже
+# уехало или обрабатывается складом МП → показываем без кнопок в «В пути».
+PLANNED_STATUSES = {"CREATED", "ACCEPTED_BY_WAREHOUSE_SYSTEM"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
