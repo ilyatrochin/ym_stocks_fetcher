@@ -59,8 +59,11 @@ SUPPLY_REQUESTS_SHEET = "supplies_requests"
 PACKING_SHEET = "supply_packing"
 PACKING_HEADERS = ["request_id", "packed", "packed_at", "tg_user_id", "tg_username"]
 
-# Заявки с этими статусами считаются «в пути» — товар физически движется.
-IN_TRANSIT_STATUSES = {"SHIPPED_TO_SERVICE", "SHIPPED_TO_WAREHOUSE"}
+# Заявки в статусе CREATED — единственные, к которым относится упаковка
+# (одобрены, но ещё не отгружены из офиса). Всё остальное активное
+# (READY_TO_SHIP, SHIPPED_TO_*, WAREHOUSE_HANDLING и т.п.) — уже едет/обрабатывается
+# складом МП, упаковщику там делать нечего → показываем без кнопок в «В пути».
+PLANNED_STATUSES = {"CREATED"}
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -235,7 +238,7 @@ def build_report(
     in_transit: list[tuple[int, dict]] = []
     planned: list[tuple[int, dict]] = []
     for req_id, req in requests_data.items():
-        (in_transit if req["status"] in IN_TRANSIT_STATUSES else planned).append(
+        (planned if req["status"] in PLANNED_STATUSES else in_transit).append(
             (req_id, req))
 
     key_eta = lambda x: x[1]["requested_date"] or "9999-99-99"
