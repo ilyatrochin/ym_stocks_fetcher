@@ -3,6 +3,11 @@ tg_supplies_bot.py — Telegram-бот для управления постав�
 
 Команды:
   /supplies — сводка поставок (в пути + запланированы + статус упаковки)
+  /forecast — пересчитать прогноз по текущему снапшоту и прислать сводку
+              (без обращения к YM API, быстро; остатки — как в последнем
+              утреннем прогоне fetch_ym_stocks)
+  /refresh  — сначала обновить остатки с YM API (fetch_ym_stocks), затем
+              пересчитать прогноз. Дольше, но данные свежие.
 
 Inline-кнопки (только для запланированных заявок):
   [📦 #12345 — упаковать]   → помечает заявку как упакованную
@@ -37,6 +42,8 @@ Systemd-сервис:
 """
 from __future__ import annotations
 
+import asyncio
+import html
 import logging
 import os
 import sys
@@ -396,6 +403,106 @@ async def callback_pack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Запуск скриптов прогноза/остатков как отдельных процессов
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Каталог скилла = где лежит этот файл (там же forecast_stocks.py и
+# fetch_ym_stocks.py). Запускаем их тем же интерпретатором, что и бота.
+SKILL_DIR = os.path.dirname(os.path.abspath(__file__))
+TG_MAX_LEN = 4000  # запас под лимит Telegram (4096)
+
+
+async def _run_script(args: list[str]) -> tuple[int, str, str]:
+    """Запускает `python <args>` в каталоге скилла, НЕ блокируя event loop.
+
+    Возвращает (returncode, stdout, stderr). Env наследуется от процесса
+    бота (systemd EnvironmentFile), поэтому GSHEET_ID/GOOGLE_CREDS/YM_*
+    уже на месте — тот же путь, что и у cron.
+    """
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, *args,
+        cwd=SKILL_DIR,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    out_b, err_b = await proc.communicate()
+    return (proc.returncode,
+            out_b.decode("utf-8", "replace"),
+            err_b.decode("utf-8", "replace"))
+
+
+def _clip(text: str) -> str:
+    return text if len(text) <= TG_MAX_LEN else text[:TG_MAX_LEN] + "\n…(обрезано)"
+
+
+async def cmd_forecast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Пересчитать прогноз по имеющемуся снапшоту и прислать сводку.
+
+    Запускаем forecast_stocks.py с --dry-run: он считает и ПЕЧАТАЕТ сводку
+    в stdout, но НЕ пишет в лист forecast и НЕ шлёт свой TG-месседж
+    (send_telegram под `not dry_run`). Это важно — иначе:
+      - повторные /forecast за день плодили бы дубли строк в forecast;
+      - админ получал бы двойное сообщение (от скрипта и от бота).
+    Отвечаем сами, тому, кто вызвал команду.
+    """
+    if not _is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    msg = await update.message.reply_text("⏳ Считаю прогноз по текущим остаткам…")
+    try:
+        code, out, err = await _run_script(["forecast_stocks.py", "--dry-run"])
+        if code != 0:
+            tail = html.escape((err or out).strip()[-600:])
+            await msg.edit_text(
+                f"❌ Прогноз упал (код {code}):\n<code>{tail}</code>",
+                parse_mode="HTML")
+            return
+        summary = out.strip() or "Пустой ответ от forecast_stocks.py"
+        await msg.edit_text(_clip(summary), parse_mode="HTML")
+    except Exception as e:
+        logging.exception("cmd_forecast failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+async def cmd_refresh(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обновить остатки с YM API, затем пересчитать прогноз.
+
+    fetch_ym_stocks.py идемпотентен (upsert по дате), повторный запуск
+    безопасен. После него — forecast_stocks.py --dry-run, как в /forecast.
+    """
+    if not _is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ Нет доступа.")
+        return
+
+    msg = await update.message.reply_text(
+        "⏳ Обновляю остатки с Яндекс.Маркета (это дольше)…")
+    try:
+        code, out, err = await _run_script(["fetch_ym_stocks.py"])
+        if code != 0:
+            tail = html.escape((err or out).strip()[-600:])
+            await msg.edit_text(
+                f"❌ Обновление остатков упало (код {code}):\n<code>{tail}</code>",
+                parse_mode="HTML")
+            return
+
+        await msg.edit_text("✅ Остатки обновлены. Считаю прогноз…")
+        code, out, err = await _run_script(["forecast_stocks.py", "--dry-run"])
+        if code != 0:
+            tail = html.escape((err or out).strip()[-600:])
+            await msg.edit_text(
+                f"⚠️ Остатки обновлены, но прогноз упал (код {code}):\n"
+                f"<code>{tail}</code>",
+                parse_mode="HTML")
+            return
+        summary = out.strip() or "Пустой ответ от forecast_stocks.py"
+        await msg.edit_text(_clip(summary), parse_mode="HTML")
+    except Exception as e:
+        logging.exception("cmd_refresh failed")
+        await msg.edit_text(f"❌ Ошибка: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -415,6 +522,8 @@ def main():
 
     app = Application.builder().token(bot_token).build()
     app.add_handler(CommandHandler("supplies", cmd_supplies))
+    app.add_handler(CommandHandler("forecast", cmd_forecast))
+    app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CallbackQueryHandler(callback_pack))
 
     logging.info("Бот запущен, polling...")

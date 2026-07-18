@@ -492,6 +492,31 @@ def _restore_warehouse_name_case(name_lower: str,
 
 
 
+# Латинские буквы, которые в артикулах часто путают с кириллическими
+# (одинаковый вид, разный код). Для диагностики матчим их к кириллице.
+_HOMOGLYPH_MAP = str.maketrans({
+    "A": "А", "B": "В", "C": "С", "E": "Е", "H": "Н", "K": "К", "M": "М",
+    "O": "О", "P": "Р", "T": "Т", "X": "Х", "Y": "У",
+    "a": "а", "c": "с", "e": "е", "o": "о", "p": "р", "x": "х", "y": "у",
+})
+
+
+def _normalize_sku(sku: str) -> str:
+    """Нормализует артикул для СРАВНЕНИЯ (не для записи!): убирает NBSP и
+    zero-width, схлопывает регистр, латинские гомоглифы → кириллица.
+    Нужно только чтобы отличить «SKU реально нет в routing» от
+    «SKU есть, но отличается невидимым символом/раскладкой»."""
+    import unicodedata
+    s = unicodedata.normalize("NFKC", sku)
+    s = s.replace(" ", "").replace("​", "").strip()
+    return s.casefold().translate(_HOMOGLYPH_MAP)
+
+
+def _codepoints(s: str) -> str:
+    """'ЧХ1' → 'U+0427 U+0425 U+0031' — чтобы в логе увидеть гомоглиф."""
+    return " ".join(f"U+{ord(c):04X}" for c in s)
+
+
 def build_forecast(
     snapshots: list[StockSnapshot],
     sales: list[SalesPoint],
@@ -703,6 +728,28 @@ def build_forecast(
             filtered_pairs,
             len(routing) if routing_enabled and routing else 0,
             len(skipped_skus_set))
+
+    # ── Диагностика потерянных SKU ───────────────────────────────────
+    # По списку количеств не видно, ПОЧЕМУ конкретный SKU пропал.
+    # Логируем имена выброшенных routing'ом SKU и ищем "почти совпавшие"
+    # ключи routing: одинаковые после нормализации (регистр, NBSP,
+    # кириллица↔латиница) — верный признак гомоглифа/пробела в данных,
+    # а не отсутствия SKU в whitelist.
+    if routing_enabled and routing and skipped_skus_set:
+        norm_routing = {_normalize_sku(k): k for k in routing}
+        for sku in sorted(skipped_skus_set):
+            near = norm_routing.get(_normalize_sku(sku))
+            if near is not None and near != sku:
+                logging.warning(
+                    "SKU %r есть в снапшоте, но НЕ сматчился с routing-ключом "
+                    "%r — совпадают только после нормализации. "
+                    "Различие: снапшот=%s routing=%s (проверь регистр/пробел/"
+                    "кириллицу-латиницу)",
+                    sku, near, _codepoints(sku), _codepoints(near))
+            else:
+                logging.info(
+                    "SKU %r (%s) выброшен: отсутствует в warehouse_routing",
+                    sku, _codepoints(sku))
     return rows
 
 
@@ -847,6 +894,9 @@ def run(today: date | None = None, dry_run: bool = False,
     reader = SheetsReader(creds_path, sheet_id)
 
     snapshots = reader.read_latest_stocks(marketplace="YM")
+    snapshot_skus = sorted({s.sku for s in snapshots})
+    logging.debug("SKU в свежем снапшоте stock_marketplace (%d): %s",
+                  len(snapshot_skus), ", ".join(snapshot_skus))
     sales = reader.read_sales(since=today - timedelta(days=30))
     office = reader.read_office_ready()
     supplies = reader.read_supplies_in_transit()
