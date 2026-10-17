@@ -35,7 +35,11 @@ ls /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf   # должен быть
 ```bash
 GDRIVE_FBS_FOLDER_ID=<ID из шага 3>
 FBS_LABEL_FORMAT=A9_HORIZONTALLY   # 58×40
+TG_ALLOWED_USERS=<user_id через запятую>   # ОБЯЗАТЕЛЬНО для «Собрано»
 ```
+
+Кнопка «Собрано» работает **только** при непустом `TG_ALLOWED_USERS`
+(в отличие от остальных команд бота, которые при пустом списке открыты всем).
 
 ## 5. Проверка и перезапуск бота
 

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
 import tempfile
 from pathlib import Path
 from typing import Callable
@@ -57,6 +58,22 @@ async def _load_plan() -> tuple[fbs.YMFbsClient, fbs.FbsPlan]:
     return client, plan
 
 
+def _write_allowed(user_id: int) -> bool:
+    """Строгая проверка для действий, меняющих статусы в Маркете.
+
+    В отличие от _is_allowed бота (пустой/битый TG_ALLOWED_USERS → пускает
+    всех), здесь пустой или нечитаемый список = запрет.
+    """
+    raw = os.environ.get("TG_ALLOWED_USERS", "").strip()
+    if not raw:
+        return False
+    try:
+        allowed = {int(x.strip()) for x in raw.split(",") if x.strip()}
+    except ValueError:
+        return False
+    return user_id in allowed
+
+
 def _err_text(e: Exception) -> str:
     if isinstance(e, KeyError):
         return f"❌ Не задана переменная окружения {e}"
@@ -93,6 +110,12 @@ def register_fbs_handlers(app: Application,
             await query.answer("⛔ Нет доступа", show_alert=True)
             return
         action = query.data[len(CB_PREFIX):]
+        if action in ("ready", "ready_yes") and not _write_allowed(query.from_user.id):
+            await query.answer(
+                "⛔ «Собрано» меняет статусы в Маркете — доступно только "
+                "пользователям из TG_ALLOWED_USERS (сейчас список пуст "
+                "или вас в нём нет).", show_alert=True)
+            return
         await query.answer()
         try:
             if action == "refresh":
@@ -196,9 +219,12 @@ def register_fbs_handlers(app: Application,
             return
         await query.edit_message_text("⏳ Меняю статусы в Маркете…")
         client, plan = await _load_plan()
+        skipped_cis = [o.order_id for o in plan.orders
+                       if o.substatus == "STARTED" and o.needs_cis]
         # Переводим только то, что подтвердил человек И что всё ещё STARTED.
         plan.orders = [o for o in plan.orders if o.order_id in confirmed]
         res = await asyncio.to_thread(fbs.mark_ready_to_ship, client, plan)
+        res.skipped_cis = skipped_cis
 
         user = query.from_user.username or query.from_user.first_name or ""
         logging.info("FBS READY_TO_SHIP by %s (%s): ok=%s failed=%s",
