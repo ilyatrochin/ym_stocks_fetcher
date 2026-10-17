@@ -8,7 +8,12 @@ fbs_bot_handlers.py — Telegram-часть модуля 7 (FBS-отгрузка
   /fbs [дата] — что отгружать по FBS (сводка по SKU) + кнопки.
                 Дата: сегодня (по умолчанию), «завтра», ДД.ММ, ДД.ММ.ГГГГ,
                 ГГГГ-ММ-ДД. Кнопки помнят дату (она в callback_data).
-    [📄 Документы]     → лист сборки + ярлыки PDF в чат и на Google Drive
+  /fbs_check <номер> [номер…] [дата] — почему заказ не попал в лист:
+                статус, подстатус, дата отгрузки.
+    [📄 Документы]     → лист сборки + ярлыки PDF в чат и на Google Drive,
+                         затем (FBS_AUTO_READY=1, по умолчанию) все STARTED
+                         заказы листа → READY_TO_SHIP. Только если ярлыки
+                         получены и пользователь в TG_ALLOWED_USERS.
     [✅ Собрано (N)]   → подтверждение → STARTED → READY_TO_SHIP в Маркете
     [🔄 Обновить]      → перечитать заказы
 
@@ -109,6 +114,23 @@ def _write_allowed(user_id: int) -> bool:
     return user_id in allowed
 
 
+def _auto_ready_enabled() -> bool:
+    return os.environ.get("FBS_AUTO_READY", "1").strip().lower() not in (
+        "0", "false", "no", "нет", "")
+
+
+def _ready_lines(res: fbs.ReadyResult) -> list[str]:
+    lines = [f"✅ Переведено в «Готов к отгрузке»: <b>{len(res.updated)}</b>"]
+    if res.failed:
+        lines.append(f"❌ Не удалось: {len(res.failed)}")
+        for oid, err in res.failed[:10]:
+            lines.append(f"• {oid}: <code>{html.escape(err)[:200]}</code>")
+    if res.skipped_cis:
+        lines.append(f"🏷 Пропущены (нужен КИЗ): "
+                     f"{', '.join(map(str, res.skipped_cis[:10]))}")
+    return lines
+
+
 def _err_text(e: Exception) -> str:
     if isinstance(e, KeyError):
         return f"❌ Не задана переменная окружения {e}"
@@ -145,6 +167,46 @@ def register_fbs_handlers(app: Application,
         except Exception as e:
             logging.exception("cmd_fbs failed")
             await msg.edit_text(_err_text(e), parse_mode="HTML")
+
+    async def cmd_fbs_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_allowed(update.effective_user.id):
+            await update.message.reply_text("⛔ Нет доступа.")
+            return
+        args = [a.strip(",") for a in (context.args or [])]
+        ids = [int(a) for a in args if a.isdigit() and len(a) > 6]
+        rest = [a for a in args if not (a.isdigit() and len(a) > 6)]
+        if not ids:
+            await update.message.reply_text(
+                "Использование: /fbs_check 123456789 987654321 [дата]")
+            return
+        try:
+            ship_date = parse_ship_date(" ".join(rest), fbs.today_local())
+        except ValueError as e:
+            await update.message.reply_text(f"❓ {e}")
+            return
+        try:
+            client = fbs.make_client()
+            found = await asyncio.to_thread(client.get_orders, ids)
+        except Exception as e:
+            logging.exception("cmd_fbs_check failed")
+            await update.message.reply_text(_err_text(e), parse_mode="HTML")
+            return
+        lines = [f"🔎 <b>Проверка для листа на {ship_date:%d.%m.%Y}</b>"]
+        seen = set()
+        for raw in found:
+            o = fbs.parse_order(raw)
+            seen.add(o.order_id)
+            ship = (date.fromisoformat(o.shipment_date).strftime("%d.%m")
+                    if o.shipment_date else "—")
+            lines.append(
+                f"• <b>{o.order_id}</b>: {html.escape(str(raw.get('programType') or '?'))}, "
+                f"{html.escape(str(raw.get('status') or '?'))}/"
+                f"{html.escape(o.substatus or '—')}, отгрузка {ship}\n"
+                f"  → {html.escape(fbs.exclusion_reason(raw, ship_date))}")
+        for oid in ids:
+            if oid not in seen:
+                lines.append(f"• <b>{oid}</b>: не найден (другой кабинет?)")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -225,8 +287,41 @@ def register_fbs_handlers(app: Application,
             lines.append(f'📁 <a href="{docs.drive_url}">Папка на Google Drive</a>')
         else:
             lines.append(f"⚠️ Drive: {html.escape(docs.drive_error)[:500]}")
+
+        # Автоперевод в READY_TO_SHIP — ровно те заказы, что в документах.
+        changed = False
+        not_ready = [o for o in plan.orders if o.substatus == "STARTED"]
+        if _auto_ready_enabled() and not_ready:
+            lines.append("")
+            if not docs.labels_path:
+                lines.append("⏸ Статусы НЕ меняли: без ярлыков нечего клеить. "
+                             "Повтори «Документы» или нажми «Собрано».")
+            elif not _write_allowed(query.from_user.id):
+                lines.append("⏸ Статусы НЕ меняли: смена статусов доступна "
+                             "только пользователям из TG_ALLOWED_USERS.")
+            else:
+                await status.edit_text("\n".join(lines + ["⏳ Перевожу заказы "
+                                       "в «Готов к отгрузке»…"]),
+                                       parse_mode="HTML",
+                                       disable_web_page_preview=True)
+                res = await asyncio.to_thread(fbs.mark_ready_to_ship, client, plan)
+                logging.info("FBS auto READY_TO_SHIP %s by %s (%s): ok=%s failed=%s",
+                             plan.ship_date, query.from_user.username,
+                             query.from_user.id, res.updated, res.failed)
+                lines += _ready_lines(res)
+                changed = bool(res.updated)
+
         await status.edit_text("\n".join(lines), parse_mode="HTML",
                                disable_web_page_preview=True)
+        if changed:
+            # Обновляем исходную сводку, чтобы кнопка «Собрано (N)» не врала.
+            _, fresh = await _load_plan(ship_date)
+            try:
+                await query.edit_message_text(
+                    _clip(fbs.format_summary(fresh)), parse_mode="HTML",
+                    reply_markup=_keyboard(fresh))
+            except Exception:
+                logging.debug("summary refresh skipped", exc_info=True)
 
     async def _ask_ready(query, context, ship_date):
         await query.edit_message_text("⏳ Проверяю, какие заказы не собраны…")
@@ -279,18 +374,12 @@ def register_fbs_handlers(app: Application,
         user = query.from_user.username or query.from_user.first_name or ""
         logging.info("FBS READY_TO_SHIP by %s (%s): ok=%s failed=%s",
                      user, query.from_user.id, res.updated, res.failed)
-        lines = [f"✅ Переведено в «Готов к отгрузке»: <b>{len(res.updated)}</b>"]
-        if res.failed:
-            lines.append(f"❌ Не удалось: {len(res.failed)}")
-            for oid, err in res.failed[:10]:
-                lines.append(f"• {oid}: <code>{html.escape(err)[:200]}</code>")
-        if res.skipped_cis:
-            lines.append(f"🏷 Пропущены (нужен КИЗ): "
-                         f"{', '.join(map(str, res.skipped_cis[:10]))}")
+        lines = _ready_lines(res)
         _, fresh = await _load_plan(ship_date)
         await query.edit_message_text(
             _clip("\n".join(lines) + "\n\n" + fbs.format_summary(fresh)),
             parse_mode="HTML", reply_markup=_keyboard(fresh))
 
     app.add_handler(CommandHandler("fbs", cmd_fbs))
+    app.add_handler(CommandHandler("fbs_check", cmd_fbs_check))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^fbs:"))
