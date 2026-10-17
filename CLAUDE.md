@@ -88,7 +88,7 @@ ym_stocks_fetcher/
 | `fetch_ym_stocks.py` | `POST /v2/campaigns/{id}/offers/stocks` (withTurnover) → пагинация → `ym_stocks_raw` + `stock_marketplace` |
 | `forecast_stocks.py` | Читает snapshot + sales + office + supplies → скорости 7/14/30 → `days_to_oos` → `forecast` + TG |
 | `fbs_shipment.py` | FBS-заказы на сегодня → лист сборки PDF + ярлыки PDF → общий диск Google Drive; `mark_ready_to_ship` (см. 4.9) |
-| `fbs_bot_handlers.py` | `/fbs` в боте: сводка + кнопки «Документы» / «Собрано» / «Обновить» |
+| `fbs_bot_handlers.py` | `/fbs [дата]` в боте (`завтра`, `20.10`, `2026-10-20`): сводка + кнопки «Документы» / «Собрано» / «Обновить» |
 | `sheets_helpers.py` | **Всегда импортировать отсюда** `batch_delete_rows`, `safe_append_rows`, `with_retry` |
 
 ---
