@@ -5,7 +5,9 @@ fbs_bot_handlers.py — Telegram-часть модуля 7 (FBS-отгрузка
     register_fbs_handlers(app, is_allowed=_is_allowed)
 
 Команда:
-  /fbs — что сегодня отгружать по FBS (сводка по SKU) + кнопки:
+  /fbs [дата] — что отгружать по FBS (сводка по SKU) + кнопки.
+                Дата: сегодня (по умолчанию), «завтра», ДД.ММ, ДД.ММ.ГГГГ,
+                ГГГГ-ММ-ДД. Кнопки помнят дату (она в callback_data).
     [📄 Документы]     → лист сборки + ярлыки PDF в чат и на Google Drive
     [✅ Собрано (N)]   → подтверждение → STARTED → READY_TO_SHIP в Маркете
     [🔄 Обновить]      → перечитать заказы
@@ -20,6 +22,7 @@ import html
 import logging
 import os
 import tempfile
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -38,23 +41,55 @@ def _clip(text: str) -> str:
     return text if len(text) <= TG_MAX_LEN else text[:TG_MAX_LEN] + "\n…(обрезано)"
 
 
+def parse_ship_date(arg: str | None, today: date) -> date:
+    """'' / 'сегодня' / 'завтра' / 'послезавтра' / ДД.ММ / ДД.ММ.ГГГГ / ГГГГ-ММ-ДД."""
+    s = (arg or "").strip().lower()
+    words = {"": 0, "сегодня": 0, "today": 0, "завтра": 1, "tomorrow": 1,
+             "послезавтра": 2, "вчера": -1}
+    if s in words:
+        return today + timedelta(days=words[s])
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            pass
+    # ДД.ММ разбираем руками: strptime без года в новых Python запрещён
+    try:
+        dd, mm = (int(x) for x in s.split("."))
+        d = date(today.year, mm, dd)
+    except ValueError:
+        raise ValueError(
+            f"Не понял дату «{arg}». Примеры: /fbs завтра, /fbs 20.10, "
+            f"/fbs 2026-10-20") from None
+    # 03.01 в конце декабря — это уже следующий год
+    if d < today - timedelta(days=180):
+        d = d.replace(year=today.year + 1)
+    return d
+
+
+def _cb(action: str, ship_date: date) -> str:
+    return f"{CB_PREFIX}{action}:{ship_date.isoformat()}"
+
+
 def _keyboard(plan: fbs.FbsPlan) -> InlineKeyboardMarkup | None:
+    d = plan.ship_date
     if not plan.orders:
         return InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔄 Обновить", callback_data="fbs:refresh")]])
+            [[InlineKeyboardButton("🔄 Обновить", callback_data=_cb("refresh", d))]])
     rows = [[InlineKeyboardButton("📄 Документы (ярлыки + лист сборки)",
-                                  callback_data="fbs:docs")]]
+                                  callback_data=_cb("docs", d))]]
     n = len(plan.started_orders())
     if n:
         rows.append([InlineKeyboardButton(f"✅ Собрано ({n})",
-                                          callback_data="fbs:ready")])
-    rows.append([InlineKeyboardButton("🔄 Обновить", callback_data="fbs:refresh")])
+                                          callback_data=_cb("ready", d))])
+    rows.append([InlineKeyboardButton("🔄 Обновить",
+                                      callback_data=_cb("refresh", d))])
     return InlineKeyboardMarkup(rows)
 
 
-async def _load_plan() -> tuple[fbs.YMFbsClient, fbs.FbsPlan]:
+async def _load_plan(ship_date: date) -> tuple[fbs.YMFbsClient, fbs.FbsPlan]:
     client = fbs.make_client()
-    plan = await asyncio.to_thread(fbs.load_plan, client)
+    plan = await asyncio.to_thread(fbs.load_plan, client, ship_date)
     return client, plan
 
 
@@ -95,9 +130,16 @@ def register_fbs_handlers(app: Application,
         if not is_allowed(update.effective_user.id):
             await update.message.reply_text("⛔ Нет доступа.")
             return
-        msg = await update.message.reply_text("⏳ Загружаю FBS-заказы на сегодня…")
         try:
-            _, plan = await _load_plan()
+            ship_date = parse_ship_date(" ".join(context.args or []),
+                                        fbs.today_local())
+        except ValueError as e:
+            await update.message.reply_text(f"❓ {e}")
+            return
+        msg = await update.message.reply_text(
+            f"⏳ Загружаю FBS-заказы на {ship_date.strftime('%d.%m.%Y')}…")
+        try:
+            _, plan = await _load_plan(ship_date)
             await msg.edit_text(_clip(fbs.format_summary(plan)),
                                 parse_mode="HTML", reply_markup=_keyboard(plan))
         except Exception as e:
@@ -109,7 +151,12 @@ def register_fbs_handlers(app: Application,
         if not is_allowed(query.from_user.id):
             await query.answer("⛔ Нет доступа", show_alert=True)
             return
-        action = query.data[len(CB_PREFIX):]
+        # fbs:<action>:<YYYY-MM-DD>; без даты (кнопки до обновления) — сегодня
+        action, _, d = query.data[len(CB_PREFIX):].partition(":")
+        try:
+            ship_date = date.fromisoformat(d) if d else fbs.today_local()
+        except ValueError:
+            ship_date = fbs.today_local()
         if action in ("ready", "ready_yes") and not _write_allowed(query.from_user.id):
             await query.answer(
                 "⛔ «Собрано» меняет статусы в Маркете — доступно только "
@@ -119,34 +166,36 @@ def register_fbs_handlers(app: Application,
         await query.answer()
         try:
             if action == "refresh":
-                await _refresh(query)
+                await _refresh(query, ship_date)
             elif action == "docs":
-                await _send_docs(query, context)
+                await _send_docs(query, context, ship_date)
             elif action == "ready":
-                await _ask_ready(query, context)
+                await _ask_ready(query, context, ship_date)
             elif action == "ready_yes":
-                await _do_ready(query, context)
+                await _do_ready(query, context, ship_date)
             elif action == "ready_no":
                 context.user_data.pop(READY_IDS_KEY, None)
-                await _refresh(query)
+                await _refresh(query, ship_date)
         except Exception as e:
             logging.exception("fbs callback %s failed", action)
             await query.message.reply_text(_err_text(e), parse_mode="HTML")
 
-    async def _refresh(query):
+    async def _refresh(query, ship_date):
         await query.edit_message_text("⏳ Обновляю…")
-        _, plan = await _load_plan()
+        _, plan = await _load_plan(ship_date)
         await query.edit_message_text(_clip(fbs.format_summary(plan)),
                                       parse_mode="HTML",
                                       reply_markup=_keyboard(plan))
 
-    async def _send_docs(query, context):
+    async def _send_docs(query, context, ship_date):
         chat_id = query.message.chat_id
         status = await context.bot.send_message(
             chat_id, "⏳ Формирую документы (ярлыки Маркет генерирует до пары минут)…")
-        client, plan = await _load_plan()
+        client, plan = await _load_plan(ship_date)
         if not plan.orders:
-            await status.edit_text("✅ Отгружать сегодня нечего — документов нет.")
+            await status.edit_text(
+                f"✅ На {ship_date.strftime('%d.%m.%Y')} отгружать нечего — "
+                f"документов нет.")
             return
 
         with tempfile.TemporaryDirectory(prefix="fbs_") as tmp:
@@ -179,9 +228,9 @@ def register_fbs_handlers(app: Application,
         await status.edit_text("\n".join(lines), parse_mode="HTML",
                                disable_web_page_preview=True)
 
-    async def _ask_ready(query, context):
+    async def _ask_ready(query, context, ship_date):
         await query.edit_message_text("⏳ Проверяю, какие заказы не собраны…")
-        _, plan = await _load_plan()
+        _, plan = await _load_plan(ship_date)
         started = plan.started_orders()
         if not started:
             await query.edit_message_text(
@@ -191,7 +240,8 @@ def register_fbs_handlers(app: Application,
             return
         context.user_data[READY_IDS_KEY] = [o.order_id for o in started]
         qty = sum(o.total_qty for o in started)
-        text = (f"❓ Перевести <b>{len(started)}</b> заказ(ов), {qty} шт, в статус "
+        text = (f"❓ Отгрузка {ship_date.strftime('%d.%m.%Y')}: перевести "
+                f"<b>{len(started)}</b> заказ(ов), {qty} шт, в статус "
                 f"<b>«Готов к отгрузке»</b> в Яндекс.Маркете?\n\n"
                 f"Делай это только когда всё упаковано и ярлыки наклеены. "
                 f"Отменить из бота нельзя.")
@@ -204,13 +254,13 @@ def register_fbs_handlers(app: Application,
                                       reply_markup=InlineKeyboardMarkup([[
                                           InlineKeyboardButton(
                                               "✅ Да, перевести",
-                                              callback_data="fbs:ready_yes"),
+                                              callback_data=_cb("ready_yes", ship_date)),
                                           InlineKeyboardButton(
                                               "✖️ Отмена",
-                                              callback_data="fbs:ready_no"),
+                                              callback_data=_cb("ready_no", ship_date)),
                                       ]]))
 
-    async def _do_ready(query, context):
+    async def _do_ready(query, context, ship_date):
         confirmed = set(context.user_data.pop(READY_IDS_KEY, []))
         if not confirmed:
             await query.edit_message_text(
@@ -218,7 +268,7 @@ def register_fbs_handlers(app: Application,
                 "Нажми «Собрано» ещё раз.")
             return
         await query.edit_message_text("⏳ Меняю статусы в Маркете…")
-        client, plan = await _load_plan()
+        client, plan = await _load_plan(ship_date)
         skipped_cis = [o.order_id for o in plan.orders
                        if o.substatus == "STARTED" and o.needs_cis]
         # Переводим только то, что подтвердил человек И что всё ещё STARTED.
@@ -237,7 +287,7 @@ def register_fbs_handlers(app: Application,
         if res.skipped_cis:
             lines.append(f"🏷 Пропущены (нужен КИЗ): "
                          f"{', '.join(map(str, res.skipped_cis[:10]))}")
-        _, fresh = await _load_plan()
+        _, fresh = await _load_plan(ship_date)
         await query.edit_message_text(
             _clip("\n".join(lines) + "\n\n" + fbs.format_summary(fresh)),
             parse_mode="HTML", reply_markup=_keyboard(fresh))

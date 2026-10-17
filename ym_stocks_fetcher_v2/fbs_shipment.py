@@ -788,7 +788,7 @@ def format_summary(plan: FbsPlan, max_skus: int = 25) -> str:
     import html as _html
     d = plan.ship_date.strftime("%d.%m.%Y")
     if not plan.orders:
-        lines = [f"🚚 <b>FBS на {d}</b>", "", "✅ Отгружать сегодня нечего"]
+        lines = [f"🚚 <b>FBS на {d}</b>", "", "✅ Отгружать на эту дату нечего"]
         lines += [""] + plan.warnings if plan.warnings else []
         return "\n".join(lines)
 
