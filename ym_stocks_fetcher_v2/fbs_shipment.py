@@ -247,10 +247,13 @@ class YMFbsClient:
     def iter_open_fbs_orders(self) -> Iterator[dict]:
         """Все неотгруженные FBS-заказы без фильтра по дате и подстатусу
         (создание — последние 30 дней, дефолт API). Для сверки «что не
-        попало в план и почему»."""
+        попало в план и почему».
+
+        PENDING фильтром не передаём: API v1 отвечает 400 «Statuses [PENDING]
+        are not allowed» — он для DBS, у FBS такого статуса нет."""
         return self._iter_orders({
             "programTypes": ["FBS"],
-            "statuses": ["PROCESSING", "PENDING"],
+            "statuses": ["PROCESSING"],
             "fake": False,
         })
 
