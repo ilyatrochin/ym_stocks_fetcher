@@ -8,6 +8,8 @@ fbs_bot_handlers.py — Telegram-часть модуля 7 (FBS-отгрузка
   /fbs [дата] — что отгружать по FBS (сводка по SKU) + кнопки.
                 Дата: сегодня (по умолчанию), «завтра», ДД.ММ, ДД.ММ.ГГГГ,
                 ГГГГ-ММ-ДД. Кнопки помнят дату (она в callback_data).
+  /fbs_check <номер> [номер…] [дата] — почему заказ не попал в лист:
+                статус, подстатус, дата отгрузки.
     [📄 Документы]     → лист сборки + ярлыки PDF в чат и на Google Drive
     [✅ Собрано (N)]   → подтверждение → STARTED → READY_TO_SHIP в Маркете
     [🔄 Обновить]      → перечитать заказы
@@ -145,6 +147,46 @@ def register_fbs_handlers(app: Application,
         except Exception as e:
             logging.exception("cmd_fbs failed")
             await msg.edit_text(_err_text(e), parse_mode="HTML")
+
+    async def cmd_fbs_check(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_allowed(update.effective_user.id):
+            await update.message.reply_text("⛔ Нет доступа.")
+            return
+        args = [a.strip(",") for a in (context.args or [])]
+        ids = [int(a) for a in args if a.isdigit() and len(a) > 6]
+        rest = [a for a in args if not (a.isdigit() and len(a) > 6)]
+        if not ids:
+            await update.message.reply_text(
+                "Использование: /fbs_check 123456789 987654321 [дата]")
+            return
+        try:
+            ship_date = parse_ship_date(" ".join(rest), fbs.today_local())
+        except ValueError as e:
+            await update.message.reply_text(f"❓ {e}")
+            return
+        try:
+            client = fbs.make_client()
+            found = await asyncio.to_thread(client.get_orders, ids)
+        except Exception as e:
+            logging.exception("cmd_fbs_check failed")
+            await update.message.reply_text(_err_text(e), parse_mode="HTML")
+            return
+        lines = [f"🔎 <b>Проверка для листа на {ship_date:%d.%m.%Y}</b>"]
+        seen = set()
+        for raw in found:
+            o = fbs.parse_order(raw)
+            seen.add(o.order_id)
+            ship = (date.fromisoformat(o.shipment_date).strftime("%d.%m")
+                    if o.shipment_date else "—")
+            lines.append(
+                f"• <b>{o.order_id}</b>: {html.escape(str(raw.get('programType') or '?'))}, "
+                f"{html.escape(str(raw.get('status') or '?'))}/"
+                f"{html.escape(o.substatus or '—')}, отгрузка {ship}\n"
+                f"  → {html.escape(fbs.exclusion_reason(raw, ship_date))}")
+        for oid in ids:
+            if oid not in seen:
+                lines.append(f"• <b>{oid}</b>: не найден (другой кабинет?)")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
     async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
@@ -293,4 +335,5 @@ def register_fbs_handlers(app: Application,
             parse_mode="HTML", reply_markup=_keyboard(fresh))
 
     app.add_handler(CommandHandler("fbs", cmd_fbs))
+    app.add_handler(CommandHandler("fbs_check", cmd_fbs_check))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^fbs:"))

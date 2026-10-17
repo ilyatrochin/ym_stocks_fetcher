@@ -145,6 +145,8 @@ class FbsPlan:
     orders: list[FbsOrder] = field(default_factory=list)
     shipments: list[FbsShipment] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # Неотгруженные FBS-заказы, не попавшие в план: (order_id, причина)
+    excluded: list[tuple[int, str]] = field(default_factory=list)
 
     @property
     def total_qty(self) -> int:
@@ -231,8 +233,7 @@ class YMFbsClient:
 
     # --- заказы -------------------------------------------------------
     def iter_fbs_orders(self, ship_from: date, ship_to_excl: date) -> Iterator[dict]:
-        url = f"{API_BASE}{ORDERS_ENDPOINT.format(business_id=self.business_id)}"
-        body = {
+        return self._iter_orders({
             "programTypes": ["FBS"],
             "statuses": ["PROCESSING"],
             "substatuses": FBS_SUBSTATUSES,
@@ -241,7 +242,28 @@ class YMFbsClient:
                 "shipmentDateFrom": ship_from.isoformat(),
                 "shipmentDateTo": ship_to_excl.isoformat(),   # не включительно
             },
-        }
+        })
+
+    def iter_open_fbs_orders(self) -> Iterator[dict]:
+        """Все неотгруженные FBS-заказы без фильтра по дате и подстатусу
+        (создание — последние 30 дней, дефолт API). Для сверки «что не
+        попало в план и почему»."""
+        return self._iter_orders({
+            "programTypes": ["FBS"],
+            "statuses": ["PROCESSING", "PENDING"],
+            "fake": False,
+        })
+
+    def get_orders(self, order_ids: list[int]) -> list[dict]:
+        """Заказы по номерам, без прочих фильтров (диагностика)."""
+        out: list[dict] = []
+        for i in range(0, len(order_ids), PAGE_LIMIT):
+            out.extend(self._iter_orders(
+                {"orderIds": order_ids[i:i + PAGE_LIMIT]}))
+        return out
+
+    def _iter_orders(self, body: dict) -> Iterator[dict]:
+        url = f"{API_BASE}{ORDERS_ENDPOINT.format(business_id=self.business_id)}"
         page_token = None
         while True:
             params = {"limit": PAGE_LIMIT}
@@ -437,6 +459,12 @@ def load_plan(client: YMFbsClient, ship_date: date | None = None) -> FbsPlan:
             logging.warning("Shipments lookup failed for campaign %s: %s", cid, e)
             plan.warnings.append(f"ℹ️ Отгрузки кампании {cid} не получены: {e}")
 
+    try:
+        reconcile_open_orders(client, plan)
+    except Exception as e:
+        logging.warning("Open orders reconcile failed: %s", e)
+        plan.warnings.append(f"ℹ️ Сверка с остальными заказами не удалась: {e}")
+
     in_shipments = {oid for s in plan.shipments for oid in s.order_ids}
     missing = in_shipments - plan_ids
     if missing:
@@ -444,6 +472,39 @@ def load_plan(client: YMFbsClient, ship_date: date | None = None) -> FbsPlan:
             f"ℹ️ В отгрузке есть {len(missing)} заказ(ов) вне плана "
             f"(другой статус?): {', '.join(map(str, sorted(missing)[:10]))}")
     return plan
+
+
+def exclusion_reason(raw: dict, ship_date: date) -> str:
+    """Почему неотгруженный заказ не попал в план на ship_date."""
+    o = parse_order(raw)
+    status = str(raw.get("status") or "")
+    if status != "PROCESSING":
+        return f"статус {status}" + (f"/{o.substatus}" if o.substatus else "")
+    if o.substatus not in FBS_SUBSTATUSES:
+        return f"подстатус {o.substatus or '—'}"
+    if not o.shipment_date:
+        return "нет даты отгрузки"
+    if o.shipment_date != ship_date.isoformat():
+        d = date.fromisoformat(o.shipment_date)
+        if d < ship_date - timedelta(days=OVERDUE_LOOKBACK_DAYS):
+            return f"отгрузка {d:%d.%m} (просрочка > {OVERDUE_LOOKBACK_DAYS} дн.)"
+        if d < ship_date and o.substatus == "READY_TO_SHIP":
+            return f"отгрузка {d:%d.%m}, уже собран"
+        return f"отгрузка {d:%d.%m}"
+    return "в плане"
+
+
+def reconcile_open_orders(client: YMFbsClient, plan: FbsPlan) -> None:
+    """Заполняет plan.excluded — что ещё «ждёт сборки», но не в листе."""
+    in_plan = {o.order_id for o in plan.orders}
+    for raw in client.iter_open_fbs_orders():
+        oid = int(raw.get("orderId") or raw.get("id") or 0)
+        if oid in in_plan:
+            continue
+        reason = exclusion_reason(raw, plan.ship_date)
+        if reason != "в плане":
+            plan.excluded.append((oid, reason))
+    plan.excluded.sort(key=lambda x: (x[1], x[0]))
 
 
 def _fmt_interval(frm, to) -> str:
@@ -790,6 +851,7 @@ def format_summary(plan: FbsPlan, max_skus: int = 25) -> str:
     if not plan.orders:
         lines = [f"🚚 <b>FBS на {d}</b>", "", "✅ Отгружать на эту дату нечего"]
         lines += [""] + plan.warnings if plan.warnings else []
+        lines += format_excluded(plan)
         return "\n".join(lines)
 
     started = sum(1 for o in plan.orders if o.substatus == "STARTED")
@@ -813,7 +875,22 @@ def format_summary(plan: FbsPlan, max_skus: int = 25) -> str:
     if plan.warnings:
         lines.append("")
         lines += [_html.escape(w) for w in plan.warnings]
+    lines += format_excluded(plan)
     return "\n".join(lines)
+
+
+def format_excluded(plan: FbsPlan, limit: int = 15) -> list[str]:
+    import html as _html
+    if not plan.excluded:
+        return []
+    lines = ["", f"📌 <b>Не в листе — ещё {len(plan.excluded)} "
+                 f"неотгруженных FBS-заказ(ов):</b>"]
+    for oid, reason in plan.excluded[:limit]:
+        lines.append(f"• {oid} — {_html.escape(reason)}")
+    if len(plan.excluded) > limit:
+        lines.append(f"…и ещё {len(plan.excluded) - limit}")
+    lines.append("<i>Другая дата → /fbs ДД.ММ</i>")
+    return lines
 
 
 # ----------------------------------------------------------------------
@@ -831,6 +908,9 @@ def main():
                    help="Не выкладывать на Google Drive")
     p.add_argument("--fixture", help="JSON со списком заказов вместо API "
                                      "(тест вёрстки; ярлыки пропускаются)")
+    p.add_argument("--explain", metavar="ID,ID",
+                   help="Разобрать конкретные заказы: статус, подстатус, "
+                        "дата отгрузки и почему не в плане на --date")
     p.add_argument("--verbose", "-v", action="store_true")
     args = p.parse_args()
 
@@ -842,6 +922,22 @@ def main():
     try:
         ship_date = (date.fromisoformat(args.date) if args.date
                      else today_local())
+        if args.explain:
+            ids = [int(x) for x in args.explain.replace(" ", "").split(",") if x]
+            found = make_client().get_orders(ids)
+            for raw in found:
+                o = parse_order(raw)
+                print(f"{o.order_id}: programType={raw.get('programType')} "
+                      f"status={raw.get('status')} substatus={o.substatus or '—'} "
+                      f"shipmentDate={o.shipment_date or '—'} "
+                      f"campaign={o.campaign_id} → "
+                      f"{exclusion_reason(raw, ship_date)} (на {ship_date})")
+            missing = set(ids) - {int(r.get('orderId') or r.get('id') or 0)
+                                  for r in found}
+            for oid in sorted(missing):
+                print(f"{oid}: не найден в бизнесе {os.environ.get('YM_BUSINESS_ID')}")
+            sys.exit(0)
+
         if args.fixture:
             raw = json.loads(Path(args.fixture).read_text("utf-8"))
             plan = build_plan(raw.get("orders", raw) if isinstance(raw, dict)
