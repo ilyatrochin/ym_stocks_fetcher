@@ -8,6 +8,8 @@ tg_supplies_bot.py — Telegram-бот для управления постав�
               утреннем прогоне fetch_ym_stocks)
   /refresh  — сначала обновить остатки с YM API (fetch_ym_stocks), затем
               пересчитать прогноз. Дольше, но данные свежие.
+  /fbs      — FBS-отгрузка на сегодня: лист сборки + ярлыки PDF, Google Drive,
+              кнопка «Собрано» (см. fbs_bot_handlers.py / fbs_shipment.py)
 
 Inline-кнопки (только для запланированных заявок):
   [📦 #12345 — упаковать]   → помечает заявку как упакованную
@@ -57,6 +59,7 @@ from telegram.ext import (
 )
 
 from sheets_helpers import safe_append_rows, with_retry
+from fbs_bot_handlers import register_fbs_handlers
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Константы
@@ -524,7 +527,8 @@ def main():
     app.add_handler(CommandHandler("supplies", cmd_supplies))
     app.add_handler(CommandHandler("forecast", cmd_forecast))
     app.add_handler(CommandHandler("refresh", cmd_refresh))
-    app.add_handler(CallbackQueryHandler(callback_pack))
+    app.add_handler(CallbackQueryHandler(callback_pack, pattern=r"^(pack|unpack):"))
+    register_fbs_handlers(app, is_allowed=_is_allowed)
 
     logging.info("Бот запущен, polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

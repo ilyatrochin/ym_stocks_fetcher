@@ -24,3 +24,6 @@ venv/
 
 # Логи
 *.log
+
+# FBS PDF (fbs_shipment.py --out)
+fbs_out/

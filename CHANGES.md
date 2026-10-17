@@ -1,5 +1,19 @@
 # Changelog
 
+## Модуль 7 — FBS-отгрузка на сегодня (`/fbs` в боте)
+
+Новая функциональность, не патч. Отдельно от FBY-прогноза.
+
+- `fbs_shipment.py` — FBS-заказы с отгрузкой сегодня → лист сборки (PDF,
+  reportlab) + ярлыки 58×40 от Маркета (PDF) → общий диск Google Drive.
+- `fbs_bot_handlers.py` — `/fbs`: сводка по SKU, кнопки «Документы»
+  (PDF в чат + Drive), «Собрано» (STARTED → READY_TO_SHIP с подтверждением).
+- `tg_supplies_bot.py` — регистрация `/fbs`; старый `CallbackQueryHandler`
+  ограничен `pattern=^(pack|unpack):`, чтобы не перехватывать FBS-кнопки.
+- Новые env: `GDRIVE_FBS_FOLDER_ID`, `FBS_LABEL_FORMAT`, опц. `FBS_TZ`,
+  `FBS_FONT_PATH`. Новая зависимость `reportlab`, системная — `fonts-dejavu-core`.
+
+
 ## Patch 1 — устранение runtime ошибок
 
 ### Симптомы
