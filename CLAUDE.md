@@ -87,6 +87,8 @@ ym_stocks_fetcher/
 | `fetch_ym_supplies.py` | `POST /v2/campaigns/{id}/supply-requests` + `…/items` → агрегирует активные заявки → `supplies_planned` (текущий срез) |
 | `fetch_ym_stocks.py` | `POST /v2/campaigns/{id}/offers/stocks` (withTurnover) → пагинация → `ym_stocks_raw` + `stock_marketplace` |
 | `forecast_stocks.py` | Читает snapshot + sales + office + supplies → скорости 7/14/30 → `days_to_oos` → `forecast` + TG |
+| `fbs_shipment.py` | FBS-заказы на сегодня → лист сборки PDF + ярлыки PDF → общий диск Google Drive; `mark_ready_to_ship` (см. 4.9) |
+| `fbs_bot_handlers.py` | `/fbs` в боте: сводка + кнопки «Документы» / «Собрано» / «Обновить» |
 | `sheets_helpers.py` | **Всегда импортировать отсюда** `batch_delete_rows`, `safe_append_rows`, `with_retry` |
 
 ---
@@ -165,6 +167,15 @@ days_to_oos = (qty_full + ready_office + qty_in_transit) / speed_used
 При расчёте `recommended_qty` мы вычитаем `qty_in_transit` (а не только `qty_full + ready_office`) — иначе бы рекомендовали заказывать дубль того, что уже едет.
 
 ---
+
+### 4.9. FBS-отгрузка (модуль 7) — отдельный контур в том же боте
+
+Не связан с прогнозом FBY и **ничего не пишет в Google Sheets**. Файлы: `fbs_shipment.py` (логика + CLI), `fbs_bot_handlers.py` (команда `/fbs`, подключена в `tg_supplies_bot.py` одной строкой).
+
+- **Что отгружать:** `POST /v1/businesses/{id}/orders` с `programTypes=[FBS]`, `PROCESSING` + `STARTED/READY_TO_SHIP`, `dates.shipmentDate` = сегодня (Europe/Moscow). Просроченные `STARTED` за последние 7 дней тоже попадают в план с пометкой. Отгрузки (`first-mile/shipments`) нужны только для сверки, их ошибка не мешает документам.
+- **Ярлыки** генерирует Маркет (`/v2/reports/documents/labels/generate`, формат `FBS_LABEL_FORMAT`, по умолчанию 58×40) **в том же порядке, что и лист сборки**. **Лист сборки** рисуем сами (reportlab, нужен TTF с кириллицей — `fonts-dejavu-core`).
+- **Google Drive:** только **общий диск** — у сервисного аккаунта нет своей квоты в «Моём диске». Папка `GDRIVE_FBS_FOLDER_ID/YYYY-MM-DD/`, повторный запуск перезаписывает файлы.
+- **Кнопка «Собрано»** — единственное место в проекте, которое **пишет в Маркет** (`STARTED → READY_TO_SHIP`). Только из бота, с подтверждением; переводит лишь заказы, показанные в подтверждении и всё ещё `STARTED`. Заказы с маркировкой без КИЗ пропускаются. Ключу нужен scope `inventory-and-order-processing` (на запись).
 
 ## 5. Известные проблемы и как они решены (см. `CHANGES.md`)
 
@@ -251,6 +262,7 @@ TG_ADMIN_CHAT_ID=<chat_id руководителя, через @userinfobot>
 - **Wildberries** — модуль 5 (структура та же, API другой, прогноз уже умеет любой marketplace).
 - **Расчёт ЗП/KPI сотрудников** — модуль 6.
 - **Информация о покупателях** — отдельный `GET /buyer`.
+- **FBS: сборка заказа по коробкам, передача КИЗ, акт приёма-передачи** — пока руками в кабинете (модуль 7 только читает, печатает и ставит READY_TO_SHIP).
 - **Парсинг сообщений сотрудников в Telegram** — на стороне OpenClaw.
 
 Если приходит задача из этого списка — это **новый модуль**, не патч к существующим.
@@ -274,6 +286,10 @@ python fetch_ym_orders.py
 python fetch_ym_supplies.py
 python fetch_ym_stocks.py
 python forecast_stocks.py
+
+# FBS на сегодня (модуль 7): PDF в ./fbs_out, без Drive; статусы в Маркете CLI не меняет
+python fbs_shipment.py --dry-run --verbose
+python fbs_shipment.py --date 2026-10-17          # + выгрузка на Google Drive
 
 # Backfill (только для orders и stocks — supplies даёт только текущее состояние)
 python fetch_ym_orders.py --from 2026-04-01 --to 2026-04-30
