@@ -89,8 +89,8 @@ ym_stocks_fetcher/
 | `forecast_stocks.py` | Читает snapshot + sales + office + supplies → скорости 7/14/30 → `days_to_oos` → `forecast` + TG |
 | `fbs_shipment.py` | FBS-заказы на сегодня → лист сборки PDF + ярлыки PDF → общий диск Google Drive; `mark_ready_to_ship` (см. 4.9) |
 | `fbs_bot_handlers.py` | `/fbs [дата]` в боте (`завтра`, `20.10`, `2026-10-20`): сводка + кнопки «Документы» / «Собрано» / «Обновить» |
-| `fbs_wb.py` | FBS Wildberries (модуль 7.1, этапы 1–2): план по складу (без даты), «Собрать поставку» (задания → поставка, стикеры 58×40, лист), грузоместа + их стикеры, Drive `GDRIVE_FBS_WB_FOLDER_ID`. **Не импортирует YM-модули** (см. `DESIGN_FBS_WB.md`) |
-| `fbs_wb_bot.py` | `/fbs_wb [склад]` (без даты), `/fbs_wb_check`, `/fbs_wb_boxes`; кнопки `fbswb:*` («Собрать поставку» → «сколько грузомест?»). Запись — только `TG_ALLOWED_USERS`. Грузится только при `WB_API_TOKEN` |
+| `fbs_wb.py` | FBS Wildberries (модуль 7.1, этапы 1–3): план по складу (без даты), «Собрать поставку» (задания → поставка, стикеры 58×40, лист), грузоместа + их стикеры, сдача в ПВЗ (ПВЗ по адресу `FBS_WB_SHIPPING_POINT`, `shipping-method` → `deliver` → QR), Drive `GDRIVE_FBS_WB_FOLDER_ID`. **Не импортирует YM-модули** (см. `DESIGN_FBS_WB.md`) |
+| `fbs_wb_bot.py` | `/fbs_wb [склад]` (без даты), `/fbs_wb_check`, `/fbs_wb_boxes`, `/fbs_wb_deliver`, `/fbs_wb_qr`; кнопки `fbswb:*` («Собрать поставку» → «сколько грузомест?» → «Сдать в ПВЗ» с подтверждением). Запись — только `TG_ALLOWED_USERS`. Грузится только при `WB_API_TOKEN` |
 | `sheets_helpers.py` | **Всегда импортировать отсюда** `batch_delete_rows`, `safe_append_rows`, `with_retry` |
 
 ---

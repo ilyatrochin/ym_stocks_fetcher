@@ -1,5 +1,5 @@
 """
-fbs_wb_bot.py — Telegram-часть модуля 7.1 (FBS Wildberries), этапы 1–2.
+fbs_wb_bot.py — Telegram-часть модуля 7.1 (FBS Wildberries), этапы 1–3.
 
 Независим от Яндекс-части (fbs_bot_handlers.py): свои команды, свой
 префикс callback, ни одного импорта из YM-модулей. Подключается в
@@ -13,6 +13,8 @@ tg_supplies_bot.py под флагом WB_API_TOKEN:
           единственный склад с заданиями, иначе кнопки выбора склада.
   /fbs_wb_check <id> [id…]   — почему задание (не) в листе.
   /fbs_wb_boxes <WB-GI-…> <K> — грузомест в поставке = K (больше, чем кнопок).
+  /fbs_wb_deliver <WB-GI-…>   — сдать поставку в ПВЗ (с подтверждением).
+  /fbs_wb_qr <WB-GI-…>        — QR сданной поставки ещё раз.
 
 Кнопки (порядок — DESIGN_FBS_WB.md §4.2):
     [🏬 Склад — N]           → сводка по складу
@@ -20,6 +22,9 @@ tg_supplies_bot.py под флагом WB_API_TOKEN:
                                + лист сборки → чат и Drive → «сейчас N шт,
                                сколько грузомест?»
     [1] [2] … / [🖨 Перепечатать] → ЗАПИСЬ: грузомест = K, их стикеры
+    [🚛 Сдать в ПВЗ]  (есть грузоместа) → проверки + ПВЗ из
+                      FBS_WB_SHIPPING_POINT → подтверждение:
+      [✅ Да, сдать] / [✅ <адрес>]… → ЗАПИСЬ: параметры отгрузки → deliver → QR
     [📋 Лист сборки]  [🔄 Обновить] — только чтение
 
 Запись — только пользователям из TG_ALLOWED_USERS (пустой список = никому).
@@ -128,8 +133,13 @@ def _write_allowed(user_id: int) -> bool:
 # callback_data ≤ 64 байт:
 #   wh:<склад> · pdf:<склад> · take:<склад>:<auto|new|WB-GI-…>:<стикер>
 #   box:<WB-GI-…>:<K>:<стикер>   (K=0 — не менять число, только перепечатать)
+#   ask:<WB-GI-…>:<стикер> · qr:<WB-GI-…>:<стикер> · x
+#   ship:<WB-GI-…>:<ID ПВЗ>:<заданий>:<мест>:<ГГГГММДД> — что видел человек в подтверждении
 def _cb(*parts) -> str:
-    return CB_PREFIX + ":".join(str(p) for p in parts)
+    data = CB_PREFIX + ":".join(str(p) for p in parts)
+    if len(data.encode()) > 64:   # Telegram отвергнет всё сообщение
+        raise ValueError(f"callback_data длиннее 64 байт: {data}")
+    return data
 
 
 def _choice_keyboard(exc: wb.WarehouseChoiceNeeded) -> InlineKeyboardMarkup:
@@ -166,13 +176,36 @@ def _box_keyboard(supply_id: str, units: int, existing: int,
         rows.insert(0, [InlineKeyboardButton(
             f"🖨 Перепечатать стикеры мест ({existing})",
             callback_data=_cb("box", supply_id, 0, fmt))])
+        rows.append([InlineKeyboardButton(
+            "🚛 Сдать в ПВЗ", callback_data=_cb("ask", supply_id, fmt))])
     return InlineKeyboardMarkup(rows)
+
+
+def _ship_keyboard(chk: wb.DeliverCheck, fmt: str) -> InlineKeyboardMarkup:
+    """Подтверждение: ID ПВЗ — в кнопке, сдаём ровно в показанный пункт."""
+    sid = chk.supply_id
+    seen = (chk.units, chk.boxes, chk.shipping_dt.replace("-", ""))
+    if chk.point:
+        rows = [[InlineKeyboardButton("✅ Да, сдать в ПВЗ",
+                                      callback_data=_cb("ship", sid, chk.point.id, *seen))]]
+    else:
+        rows = [[InlineKeyboardButton(f"✅ {p.label[:40]}",
+                                      callback_data=_cb("ship", sid, p.id, *seen))]
+                for p in (chk.choice.options if chk.choice else [])[:wb.POINT_BUTTONS]
+                if p.available]
+    rows.append([InlineKeyboardButton("✖️ Отмена", callback_data=_cb("x"))])
+    return InlineKeyboardMarkup(rows)
+
+
+def _qr_keyboard(sid: str, fmt: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(
+        "🖨 QR поставки", callback_data=_cb("qr", sid, fmt))]])
 
 
 def _err_text(e: Exception) -> str:
     if isinstance(e, KeyError):
         return f"❌ Не задана переменная окружения {e}"
-    if isinstance(e, (ValueError, wb.SupplyClosed)):
+    if isinstance(e, (ValueError, wb.SupplyClosed, wb.PointChoiceNeeded)):
         return f"⚠️ {html.escape(str(e))}"
     hint = ""
     if isinstance(e, wb.WBApiError) and e.status_code in (401, 403):
@@ -271,7 +304,7 @@ def register_fbs_wb_handlers(app: Application,
             await query.answer("⛔ Нет доступа", show_alert=True)
             return
         action, *parts = query.data[len(CB_PREFIX):].split(":")
-        if action in ("take", "box") and not _write_allowed(query.from_user.id):
+        if action in ("take", "box", "ask", "ship") and not _write_allowed(query.from_user.id):
             await query.answer(
                 "⛔ Это меняет данные в WB — доступно только пользователям из "
                 "TG_ALLOWED_USERS (сейчас список пуст или вас в нём нет).",
@@ -291,6 +324,21 @@ def register_fbs_wb_handlers(app: Application,
                 await _do_boxes(context.bot, query.message.chat_id,
                                 query.edit_message_text, sid,
                                 int(k) or None, fmt, query.from_user)
+            elif action == "ask":
+                sid, fmt = parts
+                await _ask_deliver(context.bot, query.message.chat_id, sid, fmt)
+            elif action == "ship":
+                sid, pid, units, boxes, ymd = parts
+                expect = (int(units), int(boxes),
+                          f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:]}")
+                await _ship(context.bot, query.message.chat_id,
+                            query.edit_message_text, sid, int(pid),
+                            _default_sticker(), query.from_user, expect)
+            elif action == "qr":
+                sid, fmt = parts
+                await _send_qr(context.bot, query.message.chat_id, sid, fmt)
+            elif action == "x":
+                await query.edit_message_text("✖️ Отменено — поставка не сдана.")
         except Exception as e:
             logging.exception("fbs_wb callback %s failed", action)
             await query.message.reply_text(_err_text(e), parse_mode="HTML")
@@ -396,7 +444,91 @@ def register_fbs_wb_handlers(app: Application,
                 logging.exception("fbs_wb boxes %s failed", sid)
                 await edit(_err_text(e), parse_mode="HTML")
 
+    async def cmd_fbs_wb_deliver(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_allowed(update.effective_user.id):
+            await update.message.reply_text("⛔ Нет доступа.")
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await update.message.reply_text("Использование: /fbs_wb_deliver WB-GI-123456")
+            return
+        if not _write_allowed(update.effective_user.id):
+            await update.message.reply_text(
+                "⛔ Сдача в ПВЗ меняет данные в WB — только для TG_ALLOWED_USERS.")
+            return
+        await _ask_deliver(context.bot, update.effective_chat.id, args[0].upper(),
+                           _default_sticker())
+
+    async def cmd_fbs_wb_qr(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not is_allowed(update.effective_user.id):
+            await update.message.reply_text("⛔ Нет доступа.")
+            return
+        args = context.args or []
+        if len(args) != 1:
+            await update.message.reply_text("Использование: /fbs_wb_qr WB-GI-123456")
+            return
+        await _send_qr(context.bot, update.effective_chat.id, args[0].upper(),
+                       _default_sticker())
+
+    async def _ask_deliver(bot, chat_id: int, sid: str, fmt: str):
+        """Проверки и ПВЗ — без записи; запись только по кнопке подтверждения."""
+        msg = await bot.send_message(chat_id, f"⏳ {sid}: проверяю поставку и ПВЗ…")
+        try:
+            chk = await asyncio.to_thread(wb.check_delivery, wb.make_client(), sid)
+        except Exception as e:
+            logging.exception("fbs_wb deliver check %s failed", sid)
+            await msg.edit_text(_err_text(e), parse_mode="HTML")
+            return
+        await msg.edit_text(_clip(wb.format_deliver_check(chk)), parse_mode="HTML",
+                            reply_markup=_ship_keyboard(chk, fmt))
+
+    async def _ship(bot, chat_id: int, edit, sid: str, point_id: int, fmt: str,
+                    user, expect: tuple[int, int, str]):
+        # Тот же замок, что у грузомест: число мест не меняется во время сдачи.
+        lock = _lock(f"supply:{sid}")
+        if lock.locked():
+            await bot.send_message(chat_id, f"⏳ {sid} уже обрабатывается…")
+            return
+        async with lock:
+            try:
+                await edit(f"⏳ {sid}: параметры отгрузки → передача в доставку…")
+                with tempfile.TemporaryDirectory(prefix="fbs_wb_") as tmp:
+                    res = await asyncio.to_thread(
+                        wb.deliver_supply, wb.make_client(), sid, point_id,
+                        Path(tmp), fmt, expect)
+                    logging.info("FBS WB delivered %s to point %s by %s (%s)",
+                                 sid, point_id, user.username, user.id)
+                    text = wb.format_delivered(res)
+                    if res.qr_path:
+                        await _send_files(bot, chat_id, [(
+                            res.qr_path, f"🔳 QR поставки {sid} — показать в ПВЗ")])
+                        url, err = await asyncio.to_thread(
+                            wb.upload_to_drive, [res.qr_path])
+                        text += (f'\n📁 <a href="{url}">Папка WB на Google Drive</a>'
+                                 if url else f"\n⚠️ Drive: {html.escape(err)[:300]}")
+                await edit(_clip(text), parse_mode="HTML",
+                           disable_web_page_preview=True,
+                           reply_markup=_qr_keyboard(sid, fmt))
+            except Exception as e:
+                logging.exception("fbs_wb deliver %s failed", sid)
+                await edit(_err_text(e), parse_mode="HTML")
+
+    async def _send_qr(bot, chat_id: int, sid: str, fmt: str):
+        try:
+            with tempfile.TemporaryDirectory(prefix="fbs_wb_") as tmp:
+                path = await asyncio.to_thread(
+                    wb.fetch_qr, wb.make_client(), sid, Path(tmp), fmt)
+                await _send_files(bot, chat_id, [(path, f"🔳 QR поставки {sid}")])
+        except Exception as e:
+            logging.exception("fbs_wb qr %s failed", sid)
+            hint = ("\nQR есть только у поставки, уже переданной в доставку."
+                    if isinstance(e, wb.WBApiError) and e.status_code in (400, 404, 409)
+                    else "")
+            await bot.send_message(chat_id, _err_text(e) + hint, parse_mode="HTML")
+
     app.add_handler(CommandHandler("fbs_wb", cmd_fbs_wb))
     app.add_handler(CommandHandler("fbs_wb_check", cmd_fbs_wb_check))
     app.add_handler(CommandHandler("fbs_wb_boxes", cmd_fbs_wb_boxes))
+    app.add_handler(CommandHandler("fbs_wb_deliver", cmd_fbs_wb_deliver))
+    app.add_handler(CommandHandler("fbs_wb_qr", cmd_fbs_wb_qr))
     app.add_handler(CallbackQueryHandler(on_callback, pattern=r"^fbswb:"))

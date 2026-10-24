@@ -1,5 +1,5 @@
 """
-fbs_wb.py — модуль 7.1: FBS-сборка Wildberries (этапы 1–2).
+fbs_wb.py — модуль 7.1: FBS-сборка Wildberries (этапы 1–3).
 
 Полностью независим от Яндекс-модуля (fbs_shipment.py): ни одного импорта
 в обе стороны, свои модели, свой HTTP-клиент, свой лист сборки. Проект —
@@ -26,7 +26,15 @@ DESIGN_FBS_WB.md.
 7. set_boxes() — грузоместа: довести число до K (POST/DELETE …/trbx) и
    стикеры мест (POST …/trbx/stickers). K спрашивается у человека.
 
-Передача в доставку (ПВЗ) — этап 3.
+Этап 3 (ЗАПИСЬ в WB, только явно: кнопка «Сдать в ПВЗ» с подтверждением
+или --deliver … --yes):
+8. Пункт отгрузки — ПВЗ из FBS_WB_SHIPPING_POINT (ID или адрес, напр.
+   «Москва, проспект Лихачёва, 22»): ищется среди
+   GET /api/marketplace/v3/fbs/supplies/{id}/shipping-points (officeType=pp,
+   shippingDt=сегодня) по адресу/названию.
+9. deliver_supply(): проверки (открыта, ПВЗ, грузоместа, маркировка) →
+   PATCH …/fbs/supplies/shipping-method (selfShipping, сегодня, ПВЗ) →
+   PATCH /api/v3/supplies/{id}/deliver → QR поставки (GET …/barcode).
 
 Запуск:
   python fbs_wb.py --list-warehouses
@@ -35,6 +43,10 @@ DESIGN_FBS_WB.md.
   python fbs_wb.py --fixture wb_orders.json --warehouse 1   # без API (тест вёрстки)
   python fbs_wb.py --warehouse офис --take [--mode new] [--no-drive]   # ЗАПИСЬ
   python fbs_wb.py --boxes WB-GI-123456:2                              # ЗАПИСЬ
+  python fbs_wb.py --points WB-GI-123456 "Лихачёва 22"   # найти ПВЗ (чтение)
+  python fbs_wb.py --deliver WB-GI-123456 [--point ID]   # проверка, без записи
+  python fbs_wb.py --deliver WB-GI-123456 --yes          # ЗАПИСЬ: сдать в ПВЗ
+  python fbs_wb.py --qr WB-GI-123456                     # QR сданной поставки
   WB_SANDBOX=1 python fbs_wb.py …                    # песочница WB
 """
 
@@ -75,6 +87,10 @@ SUPPLY_ADD_ORDERS_ENDPOINT = "/api/marketplace/v3/supplies/{supply_id}/orders"
 STICKERS_ENDPOINT = "/api/v3/orders/stickers"
 TRBX_ENDPOINT = "/api/v3/supplies/{supply_id}/trbx"
 TRBX_STICKERS_ENDPOINT = "/api/v3/supplies/{supply_id}/trbx/stickers"
+SHIPPING_POINTS_ENDPOINT = "/api/marketplace/v3/fbs/supplies/{supply_id}/shipping-points"
+SHIPPING_METHOD_ENDPOINT = "/api/marketplace/v3/fbs/supplies/shipping-method"
+DELIVER_ENDPOINT = "/api/v3/supplies/{supply_id}/deliver"
+SUPPLY_BARCODE_ENDPOINT = "/api/v3/supplies/{supply_id}/barcode"
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
@@ -93,6 +109,9 @@ ADD_SINGLE_FALLBACK = 20      # при 409 на пачку — по одному
 SUPPLY_NAME_PREFIX = "FBS WB"  # «FBS WB <складID> ДД.ММ ЧЧ:ММ» — по нему узнаём свои пустые поставки
 SUPPLY_ID_RE = r"^WB-GI-\d+$"
 BOX_BUTTONS = 6               # кнопок выбора числа грузомест
+POINT_BUTTONS = 6             # кнопок выбора ПВЗ, если адрес совпал с несколькими
+DEFAULT_CITY = "Москва"       # город ПВЗ, если не задан в адресе / FBS_WB_CITY
+SHIPPING_TYPE = "selfShipping"  # везём сами (DESIGN_FBS_WB.md §4.1)
 ORDERS_LOOKBACK_DAYS = 30     # глубина поиска деталей заданий из открытых поставок
 ORDERS_MAX_LOOKBACK_DAYS = 89 # /orders с 06.08.2026 отдаёт только 3 месяца
 
@@ -309,6 +328,13 @@ class WbPlan:
 class WBApiError(RuntimeError):
     def __init__(self, status_code: int, text: str):
         self.status_code = status_code
+        try:
+            self.body = json.loads(text) if text else {}
+        except ValueError:
+            self.body = {}
+        if not isinstance(self.body, dict):
+            self.body = {}
+        self.code = str(self.body.get("code") or "")   # напр. SupplyShippingRequired
         super().__init__(f"HTTP {status_code}: {text[:500]}")
 
 
@@ -473,6 +499,39 @@ class WBFbsClient:
             params={"type": "zplh" if fmt == "zpl" else "png"},
             json={"trbxIds": trbx_ids})
         return list(data.get("stickers") or [])
+
+    # --- сдача в ПВЗ (этап 3) -----------------------------------------
+    def get_shipping_points(self, supply_id: str, city: str, office_type: str,
+                            shipping_dt: str) -> list[dict]:
+        """Пункты отгрузки поставки. В поставке должно быть ≥1 задание
+        (иначе 409 SupplyHasZeroOrders). shippingDt шлём всегда: для МГТ/КГТ+
+        обязателен, и тогда available — про эту дату."""
+        data = self._request(
+            "GET", SHIPPING_POINTS_ENDPOINT.format(supply_id=supply_id),
+            params={"city": city, "officeType": office_type,
+                    "shippingDt": shipping_dt})
+        return list(data.get("shippingPoints") or [])
+
+    def set_shipping_method(self, supply_id: str, point_id: int,
+                            shipping_dt: str, shipping_type: str) -> dict:
+        """HTTP 200 даже при ошибке: результат — по каждой поставке в results[]."""
+        data = self._request("PATCH", SHIPPING_METHOD_ENDPOINT, json={"data": [{
+            "supplyId": supply_id, "shippingPointId": int(point_id),
+            "shippingDt": shipping_dt, "shippingType": shipping_type}]})
+        for r in data.get("results") or []:
+            if r.get("supplyId") == supply_id:
+                return r
+        return {}
+
+    def deliver(self, supply_id: str) -> None:
+        """Закрывает поставку, задания → complete. Необратимо."""
+        self._request("PATCH", DELIVER_ENDPOINT.format(supply_id=supply_id))
+
+    def get_supply_barcode(self, supply_id: str, fmt: str) -> dict:
+        """QR поставки {barcode, file}; только для переданной в доставку."""
+        return self._request(
+            "GET", SUPPLY_BARCODE_ENDPOINT.format(supply_id=supply_id),
+            params={"type": "zplh" if fmt == "zpl" else "png"})
 
 
 # ----------------------------------------------------------------------
@@ -1135,6 +1194,299 @@ def set_boxes(client: WBFbsClient, supply_id: str, k: int | None,
 
 
 # ----------------------------------------------------------------------
+# Этап 3: сдача в ПВЗ — пункт отгрузки, shipping-method, deliver, QR (ЗАПИСЬ)
+# ----------------------------------------------------------------------
+@dataclass
+class WbShippingPoint:
+    id: int
+    name: str
+    address: str
+    city: str = ""
+    office_type: str = ""
+    available: bool = True
+
+    @property
+    def label(self) -> str:
+        return self.address or self.name
+
+
+def parse_point(raw: dict) -> WbShippingPoint:
+    return WbShippingPoint(
+        id=int(raw["id"]), name=str(raw.get("name") or ""),
+        address=str(raw.get("address") or ""), city=str(raw.get("city") or ""),
+        office_type=str(raw.get("officeType") or ""),
+        available=raw.get("available") is not False)
+
+
+# Типы улиц и служебные слова адреса: «проспект/пр-кт/просп.», «г», «д.» и т.п.
+# WB и человек пишут их по-разному — сравниваем без них.
+ADDR_STOP = {
+    "г", "гор", "город", "д", "дом", "ул", "улица", "пр", "кт", "т", "просп",
+    "проспект", "пркт", "ш", "шоссе", "пер", "переулок", "б", "р", "бул",
+    "бульвар", "наб", "набережная", "пл", "площадь", "проезд", "туп", "тупик",
+    "мкр", "микрорайон", "россия", "рф", "обл", "область", "пвз", "wb",
+    "wildberries", "вайлдберриз",
+}
+
+
+CITY_WORDS = {"г", "гор", "город", "россия", "рф", "обл", "область"}
+
+
+def addr_tokens(text: str) -> list[str]:
+    """«г Москва, Проспект Лихачёва 22к1» → ['москва', 'лихачева', '22к1']."""
+    low = (text or "").lower().replace("ё", "е")
+    return [t for t in re.findall(r"\d+[а-яa-z]*\d*|[а-яa-z]+", low)
+            if t not in ADDR_STOP]
+
+
+def _word_match(w: str, tokens: list[str]) -> bool:
+    # Окончания у WB и у человека расходятся («Лихачёва»/«Лихачева»/«Лихачёв»).
+    return any(t == w or (len(w) >= 6 and len(t) >= 6 and t[:6] == w[:6])
+               for t in tokens)
+
+
+def match_points(points: list[WbShippingPoint], query: str,
+                 city: str = "") -> tuple[list[WbShippingPoint], list[WbShippingPoint]]:
+    """(точные, похожие). Точный — все слова запроса и номер дома целиком
+    («22» ≠ «122», «22» ≠ «22к1»). Похожий — та же улица, другой дом/корпус."""
+    city_t = set(addr_tokens(city))
+    q = [t for t in dict.fromkeys(addr_tokens(query)) if t not in city_t]
+    words = [t for t in q if not t[0].isdigit()]
+    houses = [t for t in q if t[0].isdigit()]
+    if not words and not houses:
+        return [], []
+    exact, near = [], []
+    for p in points:
+        tokens = addr_tokens(f"{p.name} {p.address}")
+        if not all(_word_match(w, tokens) for w in words):
+            continue
+        if all(h in tokens for h in houses):
+            exact.append(p)
+        elif words:
+            near.append(p)
+    # Сначала дома, начинающиеся с нужного номера (22к1 при поиске 22).
+    near.sort(key=lambda p: not any(
+        t.startswith(h) for h in houses for t in addr_tokens(p.address)))
+    return exact, near
+
+
+class PointChoiceNeeded(Exception):
+    """Адрес ПВЗ совпал с несколькими пунктами (или ни с одним точно)."""
+
+    def __init__(self, options: list[WbShippingPoint], message: str):
+        super().__init__(message)
+        self.options = options
+
+
+def point_setting() -> tuple[int | None, str, str]:
+    """FBS_WB_SHIPPING_POINT → (ID или None, город, адрес-запрос).
+
+    «123456» — ID; иначе адрес: «Москва, проспект Лихачёва, 22». Город —
+    FBS_WB_CITY, иначе первая часть адреса до запятой (если без цифр),
+    иначе Москва."""
+    raw = os.environ.get("FBS_WB_SHIPPING_POINT", "").strip()
+    city = os.environ.get("FBS_WB_CITY", "").strip()
+    if raw.isdigit():
+        return int(raw), city or DEFAULT_CITY, ""
+    return None, city or city_from_address(raw) or DEFAULT_CITY, raw
+
+
+def city_from_address(raw: str) -> str:
+    """«Москва, проспект …» → «Москва»; «проспект Лихачёва, 22» → ""."""
+    city = ""
+    first = raw.split(",")[0].strip()
+    first_words = set(re.findall(r"[а-яa-z]+", first.lower().replace("ё", "е")))
+    is_street = bool(first_words & (ADDR_STOP - CITY_WORDS))
+    if "," in raw and first and not is_street and not re.search(r"\d", first):
+        city = re.sub(r"^(г\.?|город)\s+", "", first, flags=re.I)
+    return city
+
+
+def today_iso() -> str:
+    return now_local().date().isoformat()
+
+
+def find_points(client: WBFbsClient, supply_id: str, query: str,
+                city: str = "", shipping_dt: str = "") -> tuple[list, list, list]:
+    """(все ПВЗ города, точные, похожие) — для --points и выбора в боте."""
+    if not city:
+        _, city, _ = point_setting()
+    raw = client.get_shipping_points(supply_id, city, "pp",
+                                     shipping_dt or today_iso())
+    points = [parse_point(r) for r in raw]
+    if not query:
+        return points, [], []
+    exact, near = match_points(points, query, city)
+    return points, exact, near
+
+
+def resolve_point(client: WBFbsClient, supply_id: str,
+                  shipping_dt: str) -> WbShippingPoint:
+    """ПВЗ из FBS_WB_SHIPPING_POINT. Один точный и доступный — он; иначе
+    PointChoiceNeeded / ValueError. Другой ПВЗ молча не выбираем."""
+    pid, city, query = point_setting()
+    if pid is None and not query:
+        raise ValueError(
+            "Не задан ПВЗ: добавьте в .env FBS_WB_SHIPPING_POINT=«Москва, "
+            "проспект Лихачёва, 22» (адрес) или ID пункта")
+    points, exact, near = find_points(client, supply_id, query, city, shipping_dt)
+    if pid is not None:
+        exact = [p for p in points if p.id == pid]
+        if not exact:
+            raise ValueError(f"ПВЗ с ID {pid} не найден среди пунктов отгрузки "
+                             f"поставки {supply_id} ({city}, {shipping_dt})")
+    if len(exact) > 1:
+        raise PointChoiceNeeded(exact, f"Адрес «{query}» совпал с {len(exact)} ПВЗ — выберите")
+    if not exact:
+        if near:
+            raise PointChoiceNeeded(
+                near, f"ПВЗ «{query}» точно не найден ({city}). Похожие:")
+        raise ValueError(f"ПВЗ «{query}» не найден среди {len(points)} ПВЗ "
+                         f"({city}), куда WB принимает эту поставку. Проверьте "
+                         f"адрес: python fbs_wb.py --points {supply_id} \"улица дом\"")
+    p = exact[0]
+    if not p.available:
+        raise ValueError(f"ПВЗ «{p.label}» перегружен на {shipping_dt} — WB не "
+                         f"принимает туда поставки в эту дату. Выберите другой ПВЗ "
+                         f"(FBS_WB_SHIPPING_POINT) или сдайте в другой день.")
+    return p
+
+
+@dataclass
+class DeliverCheck:
+    """Всё, что показываем перед «Да, сдать» (ничего не пишет)."""
+    supply_id: str
+    name: str
+    units: int
+    boxes: int
+    shipping_dt: str
+    cancelled: list[int] = field(default_factory=list)
+    point: WbShippingPoint | None = None
+    choice: PointChoiceNeeded | None = None
+
+
+@dataclass
+class DeliverResult:
+    supply_id: str
+    point_id: int
+    shipping_dt: str
+    qr_path: Path | None = None
+    qr_error: str = ""
+
+
+DELIVER_ERRORS = {
+    "SupplyShippingRequired": "WB не видит параметров отгрузки (ПВЗ, дата, способ)",
+    "FulfillmentSupplyBoxesRequired": "в поставке нет грузомест — добавьте их",
+    "SupplyHasZeroOrders": "в поставке нет заданий",
+    "MetaValidationFail": "маркировка заданий не прошла проверку",
+}
+SHIPPING_METHOD_ERRORS = {
+    "IncorrectRequestBody": "WB отклонил параметры (ПВЗ не найден / неверная дата)",
+    "FulfillmentRequired": "в этом пункте нет услуги «Фулфилмент в СЦ»",
+    "NotFound": "поставка не найдена",
+    "SupplyAlreadyScanned": "поставка уже отсканирована в пункте отгрузки",
+    "InvalidShippingDt": "WB не принимает эту дату отгрузки",
+}
+
+
+def _deliver_precheck(client: WBFbsClient, supply_id: str) -> DeliverCheck:
+    raw = check_open(client, supply_id)
+    if raw.get("isPickupPointShipmentAllowed") is False:
+        raise ValueError(f"Поставку {supply_id} нельзя сдать в ПВЗ — только на "
+                         f"СЦ/склад WB (пока в кабинете WB)")
+    ids = client.get_supply_order_ids(supply_id)
+    if not ids:
+        raise ValueError(f"В поставке {supply_id} нет заданий")
+    boxes = len(client.list_trbx(supply_id))
+    if not boxes:
+        raise ValueError(f"У поставки {supply_id} нет грузомест — сначала "
+                         f"выберите их число (/fbs_wb_boxes {supply_id} K)")
+    blockers = {oid: b for oid, d in client.get_meta(ids).items()
+                if (b := meta_blockers(d))}
+    if blockers:
+        lines = [f"{oid}: {', '.join(b)}" for oid, b in list(blockers.items())[:10]]
+        raise ValueError(f"Нельзя сдать {supply_id}: не указана или не прошла "
+                         f"проверку маркировка у {len(blockers)} зад.\n"
+                         + "\n".join(lines))
+    st = client.get_statuses(ids)
+    cancelled = [oid for oid, (sup, wbs) in st.items()
+                 if sup in CANCELLED_SUPPLIER or wbs in CANCELLED_WB]
+    return DeliverCheck(supply_id, str(raw.get("name") or ""), len(ids), boxes,
+                        today_iso(), cancelled)
+
+
+def check_delivery(client: WBFbsClient, supply_id: str) -> DeliverCheck:
+    """Шаг «подтверждение»: проверки + ПВЗ. Ничего не пишет в WB."""
+    chk = _deliver_precheck(client, supply_id)
+    try:
+        chk.point = resolve_point(client, supply_id, chk.shipping_dt)
+    except PointChoiceNeeded as e:
+        chk.choice = e
+    return chk
+
+
+class ConfirmationStale(ValueError):
+    pass
+
+
+def deliver_supply(client: WBFbsClient, supply_id: str, point_id: int,
+                   out_dir: Path, fmt: str = DEFAULT_STICKER,
+                   expect: tuple[int, int, str] | None = None) -> DeliverResult:
+    """ЗАПИСЬ, необратимо: параметры отгрузки (сами, сегодня, ПВЗ point_id) →
+    передать в доставку → QR. point_id — тот, что человек видел в подтверждении.
+
+    expect = (заданий, мест, дата) из подтверждения: если поставка с тех пор
+    изменилась (кто-то нажал «Собрать», поменял места) или наступил другой
+    день — не сдаём, просим подтвердить заново."""
+    chk = _deliver_precheck(client, supply_id)
+    if expect is not None and (chk.units, chk.boxes, chk.shipping_dt) != tuple(expect):
+        units, boxes, dt = expect
+        raise ConfirmationStale(
+            f"Поставка {supply_id} изменилась после подтверждения (было {units} зад., "
+            f"{boxes} мест, {dt}; сейчас {chk.units} зад., {chk.boxes} мест, "
+            f"{chk.shipping_dt}). Не сдана — нажмите «🚛 Сдать в ПВЗ» ещё раз.")
+    res = DeliverResult(supply_id, point_id, chk.shipping_dt)
+    r = client.set_shipping_method(supply_id, point_id, chk.shipping_dt,
+                                   os.environ.get("FBS_WB_SHIPPING_TYPE",
+                                                  SHIPPING_TYPE).strip())
+    if not r.get("success"):
+        err = r.get("error") or {}
+        detail = str(err.get("detail") or "нет ответа по поставке")
+        raise ValueError(f"WB не принял параметры отгрузки {supply_id}: "
+                         f"{SHIPPING_METHOD_ERRORS.get(detail, detail)} "
+                         f"({err.get('code', '?')} {detail}). Поставка НЕ сдана.")
+    try:
+        client.deliver(supply_id)
+    except WBApiError as e:
+        if e.code not in DELIVER_ERRORS:
+            raise
+        msg = f"WB не передал {supply_id} в доставку: {DELIVER_ERRORS[e.code]}"
+        for o in ((e.body.get("data") or {}).get("orders") or [])[:10]:
+            msg += f"\n{o.get('id')}: " + ", ".join(
+                f"{m.get('key')}: {m.get('decision')}"
+                for m in o.get("metaDetails") or [])
+        raise ValueError(msg + ". Поставка НЕ сдана — исправьте и повторите "
+                               "«🚛 Сдать в ПВЗ».") from e
+    logging.info("Supply %s delivered to point %s on %s", supply_id, point_id,
+                 chk.shipping_dt)
+    try:
+        res.qr_path = fetch_qr(client, supply_id, out_dir, fmt)
+    except Exception as e:
+        logging.exception("QR for %s failed", supply_id)
+        res.qr_error = str(e)
+    return res
+
+
+def fetch_qr(client: WBFbsClient, supply_id: str, out_dir: Path,
+             fmt: str = DEFAULT_STICKER) -> Path:
+    """QR-код поставки (580×400) → PDF 58×40 / .zpl. Только после deliver."""
+    if not re.match(SUPPLY_ID_RE, supply_id or ""):
+        raise ValueError(f"Неверный номер поставки «{supply_id}» (нужен WB-GI-…)")
+    data = client.get_supply_barcode(supply_id, fmt)
+    return _write_stickers([data.get("file") or ""], fmt, out_dir / f"qr_{supply_id}")
+
+
+# ----------------------------------------------------------------------
 # Google Drive (общий диск) — своя копия, своя папка GDRIVE_FBS_WB_FOLDER_ID
 # ----------------------------------------------------------------------
 class DriveUploader:
@@ -1324,7 +1676,48 @@ def format_boxes(res: BoxResult) -> str:
     if res.stickers_error:
         lines.append(f"⚠️ Стикеры мест не получены: "
                      f"<code>{_html.escape(res.stickers_error)[:300]}</code>")
-    lines.append("Дальше — сдать поставку в ПВЗ (этап 3, пока в кабинете WB).")
+    if res.trbx_ids:
+        lines.append("Дальше — наклеить стикеры мест и «🚛 Сдать в ПВЗ».")
+    return "\n".join(lines)
+
+
+def format_point(p: WbShippingPoint) -> str:
+    import html as _html
+    mark = "" if p.available else " ⛔ перегружен на эту дату"
+    name = f" «{_html.escape(p.name)}»" if p.name and p.name != p.address else ""
+    return f"{_html.escape(p.address or p.name)}{name} (ID {p.id}){mark}"
+
+
+def format_deliver_check(chk: DeliverCheck) -> str:
+    """Подтверждение перед необратимой сдачей."""
+    import html as _html
+    name = f" «{_html.escape(chk.name)}»" if chk.name else ""
+    lines = [f"🚛 <b>Сдать в ПВЗ поставку {chk.supply_id}</b>{name}?",
+             f"Заданий: <b>{chk.units}</b> · грузомест: <b>{chk.boxes}</b> · "
+             f"дата: {datetime.fromisoformat(chk.shipping_dt):%d.%m.%Y} · везём сами"]
+    if chk.cancelled:
+        lines.append(f"⚠️ Отменены покупателем/WB: {', '.join(map(str, chk.cancelled[:10]))} "
+                     f"— их не везти")
+    if chk.point:
+        lines.append(f"📍 ПВЗ: {format_point(chk.point)}")
+    elif chk.choice:
+        lines.append(f"📍 {_html.escape(str(chk.choice))}")
+        for p in chk.choice.options[:POINT_BUTTONS]:
+            lines.append(f"• {format_point(p)}")
+    lines += ["", "❗ После передачи в доставку поставку нельзя изменить: "
+                  "задания перейдут в «в доставке», добавить новые будет нельзя."]
+    return "\n".join(lines)
+
+
+def format_delivered(res: DeliverResult) -> str:
+    import html as _html
+    lines = [f"✅ <b>{res.supply_id}</b> передана в доставку "
+             f"({datetime.fromisoformat(res.shipping_dt):%d.%m}, ПВЗ ID {res.point_id})."]
+    if res.qr_path:
+        lines.append("QR поставки — в файле: покажите его в ПВЗ при сдаче.")
+    else:
+        lines.append(f"⚠️ QR не получен: <code>{_html.escape(res.qr_error)[:300]}</code>"
+                     f" — повторите «🖨 QR поставки» или /fbs_wb_qr {res.supply_id}")
     return "\n".join(lines)
 
 
@@ -1384,6 +1777,16 @@ def main():
     p.add_argument("--boxes", metavar="WB-GI-…:K",
                    help="ЗАПИСЬ: довести число грузомест поставки до K (K=0 — "
                         "не менять, только стикеры)")
+    p.add_argument("--points", nargs="+", metavar=("WB-GI-…", "АДРЕС"),
+                   help="Найти ПВЗ для поставки: все ПВЗ города или по адресу "
+                        "(только чтение; в поставке нужно ≥1 задание)")
+    p.add_argument("--deliver", metavar="WB-GI-…",
+                   help="Сдать поставку в ПВЗ: без --yes только проверка")
+    p.add_argument("--point", type=int, help="С --deliver: ID ПВЗ вместо "
+                                             "FBS_WB_SHIPPING_POINT")
+    p.add_argument("--yes", action="store_true",
+                   help="С --deliver: ЗАПИСЬ, передать в доставку (необратимо)")
+    p.add_argument("--qr", metavar="WB-GI-…", help="QR сданной поставки")
     p.add_argument("--sticker", choices=STICKER_FORMATS,
                    default=os.environ.get("FBS_WB_STICKER", DEFAULT_STICKER))
     p.add_argument("--no-drive", action="store_true",
@@ -1409,6 +1812,52 @@ def main():
             sys.exit(0)
 
         out = Path(args.out)
+        if args.points:
+            sid = args.points[0].upper()
+            query = " ".join(args.points[1:])
+            _, city, _ = point_setting()
+            city = os.environ.get("FBS_WB_CITY", "").strip() \
+                or city_from_address(query) or city
+            points, exact, near = find_points(make_client(), sid, query, city)
+            shown = (exact or near) if query else points
+            print(f"ПВЗ ({city}, {today_iso()}): всего {len(points)}"
+                  + (f", точных совпадений {len(exact)}, похожих {len(near)}"
+                     if query else ""))
+            for pt in shown[:50]:
+                print(f"{pt.id}\t{'да ' if pt.available else 'НЕТ'}\t"
+                      f"{pt.address}\t{pt.name}")
+            sys.exit(0 if shown else 2)
+
+        if args.qr:
+            path = fetch_qr(make_client(), args.qr.strip().upper(), out, args.sticker)
+            print(f"QR: {path}")
+            if not args.no_drive:
+                url, err = upload_to_drive([path])
+                logging.info("Drive: %s", url or err)
+            sys.exit(0)
+
+        if args.deliver:
+            client, sid = make_client(), args.deliver.strip().upper()
+            if args.point:
+                chk = _deliver_precheck(client, sid)
+                point_id = args.point
+            else:
+                chk = check_delivery(client, sid)
+                point_id = chk.point.id if chk.point else None
+            print(re.sub(r"</?[a-z]+>", "", format_deliver_check(chk)))
+            if point_id is None:
+                print("Задайте ПВЗ точнее (FBS_WB_SHIPPING_POINT) или --point ID")
+                sys.exit(2)
+            if not args.yes:
+                print(f"Проверка пройдена. Сдать: --deliver {sid} --point {point_id} --yes")
+                sys.exit(0)
+            res = deliver_supply(client, sid, point_id, out, args.sticker)
+            print(re.sub(r"</?[a-z]+>", "", format_delivered(res)))
+            if res.qr_path and not args.no_drive:
+                url, err = upload_to_drive([res.qr_path])
+                logging.info("Drive: %s", url or err)
+            sys.exit(1 if res.qr_error else 0)
+
         if args.boxes:
             sid, _, k = args.boxes.partition(":")
             res = set_boxes(make_client(), sid.strip().upper(),
@@ -1462,7 +1911,7 @@ def main():
     except KeyError as e:
         logging.error("Missing env var: %s", e)
         sys.exit(1)
-    except (ValueError, SupplyClosed, WarehouseChoiceNeeded) as e:
+    except (ValueError, SupplyClosed, WarehouseChoiceNeeded, PointChoiceNeeded) as e:
         logging.error("%s", e)
         sys.exit(2)
     except Exception:

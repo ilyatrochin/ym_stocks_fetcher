@@ -10,7 +10,7 @@ tg_supplies_bot.py — Telegram-бот для управления постав�
               пересчитать прогноз. Дольше, но данные свежие.
   /fbs      — FBS-отгрузка на сегодня: лист сборки + ярлыки PDF, Google Drive,
               кнопка «Собрано» (см. fbs_bot_handlers.py / fbs_shipment.py)
-  /fbs_wb   — FBS Wildberries по складу (fbs_wb_bot.py / fbs_wb.py);
+  /fbs_wb   — FBS Wildberries по складу (fbs_wb_bot.py / fbs_wb.py), сдача в ПВЗ;
               подключается, только если задан WB_API_TOKEN
 
 Inline-кнопки (только для запланированных заявок):
