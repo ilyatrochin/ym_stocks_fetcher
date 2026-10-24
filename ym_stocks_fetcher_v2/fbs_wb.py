@@ -1,5 +1,5 @@
 """
-fbs_wb.py — модуль 7.1: FBS-сборка Wildberries (этап 1 — только чтение).
+fbs_wb.py — модуль 7.1: FBS-сборка Wildberries (этапы 1–2).
 
 Полностью независим от Яндекс-модуля (fbs_shipment.py): ни одного импорта
 в обе стороны, свои модели, свой HTTP-клиент, свой лист сборки. Проект —
@@ -16,21 +16,37 @@ DESIGN_FBS_WB.md.
 4. План по одному складу: группы (cargoType, crossBorderType, isB2b) —
    столько поставок понадобится на этапе 2; лист сборки PDF (reportlab).
 
-Записи в WB на этапе 1 нет. Поставки, стикеры, передача в доставку — этапы 2–3.
+Этап 2 (ЗАПИСЬ в WB, только явно: кнопки бота или --take / --boxes):
+5. take_into_supplies() — «Собрать поставку»: для каждой группы открытая
+   поставка (auto) или новая (POST /api/v3/supplies), задания добавляются
+   PATCH /api/marketplace/v3/supplies/{id}/orders (по 100) → статус confirm.
+6. Документы поставки: стикеры заданий (POST /api/v3/orders/stickers,
+   PNG 58×40 → PDF в порядке листа) + лист сборки → Google Drive
+   (GDRIVE_FBS_WB_FOLDER_ID/YYYY-MM-DD/, своя папка, не YM).
+7. set_boxes() — грузоместа: довести число до K (POST/DELETE …/trbx) и
+   стикеры мест (POST …/trbx/stickers). K спрашивается у человека.
+
+Передача в доставку (ПВЗ) — этап 3.
 
 Запуск:
   python fbs_wb.py --list-warehouses
   python fbs_wb.py --warehouse офис --verbose        # сводка + PDF в ./fbs_wb_out
   python fbs_wb.py --explain 123456,654321           # почему задание не в листе
   python fbs_wb.py --fixture wb_orders.json --warehouse 1   # без API (тест вёрстки)
+  python fbs_wb.py --warehouse офис --take [--mode new] [--no-drive]   # ЗАПИСЬ
+  python fbs_wb.py --boxes WB-GI-123456:2                              # ЗАПИСЬ
+  WB_SANDBOX=1 python fbs_wb.py …                    # песочница WB
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
+import io
 import json
 import logging
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -54,6 +70,15 @@ ORDERS_STATUS_ENDPOINT = "/api/v3/orders/status"
 SUPPLIES_ENDPOINT = "/api/v3/supplies"
 SUPPLY_ORDER_IDS_ENDPOINT = "/api/marketplace/v3/supplies/{supply_id}/order-ids"
 ORDERS_META_ENDPOINT = "/api/marketplace/v3/orders/meta"
+SUPPLY_ENDPOINT = "/api/v3/supplies/{supply_id}"
+SUPPLY_ADD_ORDERS_ENDPOINT = "/api/marketplace/v3/supplies/{supply_id}/orders"
+STICKERS_ENDPOINT = "/api/v3/orders/stickers"
+TRBX_ENDPOINT = "/api/v3/supplies/{supply_id}/trbx"
+TRBX_STICKERS_ENDPOINT = "/api/v3/supplies/{supply_id}/trbx/stickers"
+
+DRIVE_API = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
+DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
 HTTP_TIMEOUT = 30
 MAX_RETRIES = 5
@@ -62,6 +87,12 @@ MIN_INTERVAL = 0.25           # лимит WB: 300 запросов/мин, ин
 PAGE_LIMIT = 1000             # максимум limit для /orders и /supplies
 STATUS_BATCH = 1000           # максимум заданий в /orders/status
 META_BATCH = 100              # максимум заданий в /orders/meta
+ADD_BATCH = 100               # максимум заданий в добавлении к поставке
+STICKERS_BATCH = 100          # максимум стикеров за запрос
+ADD_SINGLE_FALLBACK = 20      # при 409 на пачку — по одному, не больше N (4XX = 10 запросов)
+SUPPLY_NAME_PREFIX = "FBS WB"  # «FBS WB <складID> ДД.ММ ЧЧ:ММ» — по нему узнаём свои пустые поставки
+SUPPLY_ID_RE = r"^WB-GI-\d+$"
+BOX_BUTTONS = 6               # кнопок выбора числа грузомест
 ORDERS_LOOKBACK_DAYS = 30     # глубина поиска деталей заданий из открытых поставок
 ORDERS_MAX_LOOKBACK_DAYS = 89 # /orders с 06.08.2026 отдаёт только 3 месяца
 
@@ -73,6 +104,7 @@ META_OK_SUFFIXES = ("MaySell", "SoldB2B", "Introduced")
 DEFAULT_TZ = "Europe/Moscow"
 SUPPLY_MODES = ("auto", "new")
 STICKER_FORMATS = ("58x40", "40x30", "zpl")
+DEFAULT_STICKER = "58x40"
 
 CARGO_NAMES = {1: "МГТ", 2: "СГТ", 3: "КГТ+"}
 CANCELLED_SUPPLIER = {"cancel", "cancel_carrier"}
@@ -126,6 +158,7 @@ class WbOrder:
     supply_id: str = ""        # пусто — ещё не в поставке (status new)
     supplier_status: str = "new"
     wb_status: str = ""
+    sticker: str = ""          # «partA partB» — подпись стикера, после получения
 
     @property
     def group_key(self) -> tuple:
@@ -178,6 +211,12 @@ class WbSupply:
     order_ids: list[int] = field(default_factory=list)
     warehouse_id: int = 0      # у поставки в API нет склада — берём по её заданиям
 
+    @property
+    def group_key(self) -> tuple:
+        """Как WbOrder.group_key — с какими заданиями совместима поставка."""
+        return (self.warehouse_id, self.cargo_type, self.cross_border,
+                self.is_b2b, self.pp_allowed)
+
 
 @dataclass
 class WbOverview:
@@ -212,6 +251,9 @@ class WbPlan:
     other_warehouses: list[tuple[WbWarehouse, int]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     generated_at: datetime = field(default_factory=now_local)
+    # Открытые пустые поставки, созданные ботом для этого склада (по имени) —
+    # переиспользуем, чтобы повторный «Собрать» после сбоя не плодил пустые.
+    empty_supplies: list[WbSupply] = field(default_factory=list)
 
     @property
     def orders(self) -> list[WbOrder]:
@@ -241,6 +283,13 @@ class WbPlan:
         for o in self.to_take:
             g[o.group_key].append(o)
         return dict(g)
+
+    def for_supply(self, supply_id: str) -> WbPlan:
+        """Подплан одной поставки — для её листа сборки и стикеров."""
+        sub = WbPlan(warehouse=self.warehouse, generated_at=self.generated_at)
+        sub.in_assembly = [o for o in self.in_assembly if o.supply_id == supply_id]
+        sub.supplies = [s for s in self.supplies if s.supply_id == supply_id]
+        return sub
 
     def sku_summary(self) -> list[tuple[str, int, str, int]]:
         """[(article, nm_id, barcode, qty)], по артикулу продавца."""
@@ -374,6 +423,57 @@ class WBFbsClient:
             "GET", SUPPLY_ORDER_IDS_ENDPOINT.format(supply_id=supply_id))
         return [int(x) for x in data.get("orderIds") or []]
 
+    def get_supply(self, supply_id: str) -> dict:
+        return self._request("GET", SUPPLY_ENDPOINT.format(supply_id=supply_id))
+
+    # --- запись (этап 2) ---------------------------------------------
+    def create_supply(self, name: str) -> str:
+        data = self._request("POST", SUPPLIES_ENDPOINT, json={"name": name[:128]})
+        return str(data["id"])
+
+    def add_orders(self, supply_id: str, order_ids: list[int]) -> None:
+        """До ADD_BATCH заданий за раз; 204. Задания → confirm."""
+        self._request("PATCH",
+                      SUPPLY_ADD_ORDERS_ENDPOINT.format(supply_id=supply_id),
+                      json={"orders": order_ids})
+
+    def get_stickers(self, order_ids: list[int], fmt: str) -> dict[int, dict]:
+        """order_id → {partA, partB, barcode, file}. fmt: 58x40 | 40x30 | zpl."""
+        if fmt == "zpl":
+            params = {"type": "zplh", "width": 58, "height": 40}
+        else:
+            w, h = (int(x) for x in fmt.split("x"))
+            params = {"type": "png", "width": w, "height": h}
+        out: dict[int, dict] = {}
+        for i in range(0, len(order_ids), STICKERS_BATCH):
+            data = self._request("POST", STICKERS_ENDPOINT, params=params,
+                                 json={"orders": order_ids[i:i + STICKERS_BATCH]})
+            for s in data.get("stickers") or []:
+                out[int(s["orderId"])] = s
+        return out
+
+    def list_trbx(self, supply_id: str) -> list[str]:
+        data = self._request("GET", TRBX_ENDPOINT.format(supply_id=supply_id))
+        return [str(t["id"]) for t in data.get("trbxes") or []]
+
+    def add_trbx(self, supply_id: str, amount: int) -> list[str]:
+        data = self._request("POST", TRBX_ENDPOINT.format(supply_id=supply_id),
+                             json={"amount": amount})
+        return [str(x) for x in data.get("trbxIds") or []]
+
+    def delete_trbx(self, supply_id: str, trbx_ids: list[str]) -> None:
+        self._request("DELETE", TRBX_ENDPOINT.format(supply_id=supply_id),
+                      json={"trbxIds": trbx_ids})
+
+    def get_trbx_stickers(self, supply_id: str, trbx_ids: list[str],
+                          fmt: str) -> list[dict]:
+        """[{barcode, file}] в порядке trbx_ids (насколько отдаёт API)."""
+        data = self._request(
+            "POST", TRBX_STICKERS_ENDPOINT.format(supply_id=supply_id),
+            params={"type": "zplh" if fmt == "zpl" else "png"},
+            json={"trbxIds": trbx_ids})
+        return list(data.get("stickers") or [])
+
 
 # ----------------------------------------------------------------------
 # Парсинг
@@ -474,7 +574,11 @@ def load_overview(client: WBFbsClient) -> WbOverview:
             if oid in wanted:
                 found[oid] = parse_order(raw)
         for oid, o in found.items():
-            o.supply_id = wanted[oid].supply_id
+            sup = wanted[oid]
+            o.supply_id = sup.supply_id
+            # В /orders нет isPickupPointShipmentAllowed и options.isB2B —
+            # их WB фиксирует у поставки, берём оттуда.
+            o.pp_allowed, o.is_b2b = sup.pp_allowed, sup.is_b2b
             in_assembly.append(o)
         missing = set(wanted) - set(found)
         if missing:
@@ -595,7 +699,11 @@ def build_plan(ov: WbOverview, warehouse: WbWarehouse) -> WbPlan:
         plan.warnings.append(
             f"❌ Отменены — НЕ собирать (если уже в поставке — убрать вручную): "
             f"{', '.join(str(o.order_id) for o in plan.cancelled[:10])}")
-    empty = [s.supply_id for s in ov.open_supplies if not s.order_ids]
+    own_prefix = f"{SUPPLY_NAME_PREFIX} {wid} "
+    plan.empty_supplies = [s for s in ov.open_supplies
+                           if not s.order_ids and s.name.startswith(own_prefix)]
+    empty = [s.supply_id for s in ov.open_supplies
+             if not s.order_ids and not s.name.startswith(own_prefix)]
     if empty:
         plan.warnings.append(f"ℹ️ Открытые пустые поставки: {', '.join(empty[:5])}")
     return plan
@@ -693,7 +801,10 @@ def build_picking_pdf(plan: WbPlan, path: Path) -> Path:
     ]
 
     orders = plan.orders
-    story = [Paragraph(f"Лист сборки FBS WB — {esc(plan.warehouse.name)}", st_title)]
+    title = f"Лист сборки FBS WB — {esc(plan.warehouse.name)}"
+    if len(plan.supplies) == 1 and not plan.new_orders:
+        title += f" — {esc(plan.supplies[0].supply_id)}"
+    story = [Paragraph(title, st_title)]
     story.append(Paragraph(
         f'Заданий: <font name="{font_bold}">{len(orders)}</font> · '
         f'Новых: {len(plan.to_take)} · На сборке: {len(orders) - len(plan.to_take)} · '
@@ -731,7 +842,9 @@ def build_picking_pdf(plan: WbPlan, path: Path) -> Path:
         notes = [f for f in o.flags if not f.startswith("в поставке")]
         if o.comment:
             notes.append(f"комментарий: {o.comment}")
-        rows.append(["☐", str(i), Paragraph(str(o.order_id), st_cell_b),
+        order_cell = str(o.order_id) + (
+            f"<br/><font size=7>стикер {esc(o.sticker)}</font>" if o.sticker else "")
+        rows.append(["☐", str(i), Paragraph(order_cell, st_cell_b),
                      Paragraph(esc(o.article), st_cell), str(o.nm_id or ""),
                      Paragraph(esc("; ".join(notes)), st_cell)])
         if o.needs_meta or o.comment:
@@ -773,6 +886,352 @@ def picking_filename(plan: WbPlan) -> str:
 
 
 # ----------------------------------------------------------------------
+# Этап 2: поставка, стикеры, грузоместа (ЗАПИСЬ в WB)
+# ----------------------------------------------------------------------
+class SupplyClosed(RuntimeError):
+    pass
+
+
+@dataclass
+class TakeResult:
+    created: list[str] = field(default_factory=list)
+    added: dict[str, list[int]] = field(default_factory=dict)
+    failed: list[tuple[int, str]] = field(default_factory=list)
+
+    @property
+    def added_total(self) -> int:
+        return sum(len(v) for v in self.added.values())
+
+
+@dataclass
+class SupplyDocs:
+    supply_id: str
+    name: str
+    units: int                 # активные задания в поставке = единицы товара
+    picking_path: Path
+    stickers_path: Path | None = None
+    stickers_error: str = ""
+    missing_stickers: list[int] = field(default_factory=list)
+    pp_allowed: bool = True    # False — сдавать на СЦ/склад, грузоместа не нужны
+
+
+@dataclass
+class BoxResult:
+    supply_id: str
+    units: int
+    trbx_ids: list[str] = field(default_factory=list)
+    created: list[str] = field(default_factory=list)
+    deleted: list[str] = field(default_factory=list)
+    stickers_path: Path | None = None
+    stickers_error: str = ""
+
+
+def supply_name(warehouse: WbWarehouse) -> str:
+    return f"{SUPPLY_NAME_PREFIX} {warehouse.id} {now_local():%d.%m %H:%M}"
+
+
+def max_boxes(units: int) -> int:
+    """WB: грузомест не больше половины заданий (10 → 5). Для 1 задания —
+    одно место (в спецификации не сказано; проверено не было)."""
+    return max(1, units // 2)
+
+
+def check_open(client: WBFbsClient, supply_id: str) -> dict:
+    if not re.match(SUPPLY_ID_RE, supply_id or ""):
+        raise ValueError(f"Неверный номер поставки «{supply_id}» (нужен WB-GI-…)")
+    raw = client.get_supply(supply_id)
+    if raw.get("done"):
+        raise SupplyClosed(f"Поставка {supply_id} уже закрыта (передана в доставку)")
+    return raw
+
+
+def _add_to_supply(client: WBFbsClient, supply_id: str, ids: list[int],
+                   res: TakeResult) -> None:
+    added = res.added.setdefault(supply_id, [])
+    for i in range(0, len(ids), ADD_BATCH):
+        batch = ids[i:i + ADD_BATCH]
+        for attempt in range(2):
+            try:
+                client.add_orders(supply_id, batch)
+                added.extend(batch)
+                break
+            except WBApiError as e:
+                if attempt == 0 and "SupplyIsProcessing" in str(e):
+                    time.sleep(3)
+                    continue
+                if e.status_code not in (400, 409) or len(batch) == 1:
+                    res.failed.extend((oid, str(e)) for oid in batch)
+                    break
+                # Пачка отклонена целиком — ищем виноватых по одному (дорого:
+                # каждый 4XX = 10 запросов лимита), остальное — с общей ошибкой.
+                logging.warning("Batch add to %s failed (%s), retry one by one",
+                                supply_id, e)
+                for j, oid in enumerate(batch):
+                    if j >= ADD_SINGLE_FALLBACK:
+                        res.failed.append((oid, str(e)))
+                        continue
+                    try:
+                        client.add_orders(supply_id, [oid])
+                        added.append(oid)
+                    except WBApiError as e1:
+                        res.failed.append((oid, str(e1)))
+                break
+
+
+def take_into_supplies(client: WBFbsClient, plan: WbPlan, mode: str = "auto",
+                       supply_id: str = "") -> TakeResult:
+    """«Собрать поставку»: все новые задания склада → поставки (по группам).
+
+    auto — открытая поставка с теми же признаками, иначе своя пустая
+    («FBS WB <склад> …»), иначе новая; new — всегда новая; supply_id — всё
+    в указанную (несовместимые WB отклонит, они попадут в failed)."""
+    res = TakeResult()
+    groups = plan.groups()
+    if not groups:
+        return res
+    if supply_id:
+        check_open(client, supply_id)
+    own_empty = [s for s in plan.empty_supplies]
+    for key, orders in groups.items():
+        ids = [o.order_id for o in orders]
+        if supply_id:
+            target = supply_id
+        else:
+            target = ""
+            if mode == "auto":
+                match = next((s for s in plan.supplies if s.group_key == key), None)
+                if match:
+                    target = match.supply_id
+                elif own_empty:
+                    target = own_empty.pop(0).supply_id
+            if not target:
+                target = client.create_supply(supply_name(plan.warehouse))
+                res.created.append(target)
+                logging.info("Created supply %s for group %s", target, key)
+        _add_to_supply(client, target, ids, res)
+    return res
+
+
+def _decode_sticker(file: str) -> bytes:
+    """PNG приходит base64, ZPL — иногда текстом (^XA…)."""
+    s = (file or "").strip()
+    if s.startswith("^XA"):
+        return s.encode()
+    return base64.b64decode(s)
+
+
+def images_pdf(images: list[bytes], fmt: str, path: Path) -> Path:
+    """PNG-стикеры → PDF, одна страница = один стикер нужного размера."""
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    w, h = (int(x) for x in (fmt if fmt != "zpl" else DEFAULT_STICKER).split("x"))
+    size = (w * mm, h * mm)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(path), pagesize=size)
+    for img in images:
+        c.drawImage(ImageReader(io.BytesIO(img)), 0, 0, width=size[0],
+                    height=size[1], preserveAspectRatio=True, anchor="c")
+        c.showPage()
+    c.save()
+    return path
+
+
+def _write_stickers(files: list[str], fmt: str, path_stem: Path) -> Path:
+    blobs = [_decode_sticker(f) for f in files]
+    if fmt == "zpl":
+        path = path_stem.with_suffix(".zpl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"\n".join(blobs))
+        return path
+    return images_pdf(blobs, fmt, path_stem.with_suffix(".pdf"))
+
+
+def make_supply_docs(client: WBFbsClient, plan: WbPlan, supply_id: str,
+                     out_dir: Path, fmt: str = DEFAULT_STICKER) -> SupplyDocs:
+    """Стикеры заданий (в порядке листа) + лист сборки одной поставки."""
+    sub = plan.for_supply(supply_id)
+    orders = sub.orders
+    name = sub.supplies[0].name if sub.supplies else ""
+    docs = SupplyDocs(supply_id, name, len(orders), Path(),
+                      pp_allowed=sub.supplies[0].pp_allowed if sub.supplies else True)
+    if orders:
+        try:
+            got = client.get_stickers([o.order_id for o in orders], fmt)
+            files = []
+            for o in orders:
+                s = got.get(o.order_id)
+                if not s:
+                    docs.missing_stickers.append(o.order_id)
+                    continue
+                o.sticker = f"{s.get('partA', '')} {s.get('partB', '')}".strip()
+                files.append(s.get("file") or "")
+            if files:
+                docs.stickers_path = _write_stickers(
+                    files, fmt, out_dir / f"stickers_{supply_id}")
+        except Exception as e:
+            logging.exception("Stickers for %s failed", supply_id)
+            docs.stickers_error = str(e)
+    # Лист — после стикеров, чтобы в нём были подписи стикеров.
+    docs.picking_path = build_picking_pdf(sub, out_dir / f"picking_{supply_id}.pdf")
+    return docs
+
+
+def collect_supplies(client: WBFbsClient, warehouse_ref: str | None,
+                     mode: str, supply_id: str, fmt: str,
+                     out_dir: Path) -> tuple[TakeResult, WbPlan, list[SupplyDocs]]:
+    """Полный шаг 1: взять задания в поставки, перечитать, сделать документы
+    по каждой открытой поставке склада."""
+    plan = load_plan(client, warehouse_ref)
+    res = take_into_supplies(client, plan, mode, supply_id)
+    fresh = build_plan(load_overview(client), plan.warehouse)
+    docs = [make_supply_docs(client, fresh, s.supply_id, out_dir, fmt)
+            for s in fresh.supplies if fresh.for_supply(s.supply_id).orders]
+    return res, fresh, docs
+
+
+def set_boxes(client: WBFbsClient, supply_id: str, k: int | None,
+              out_dir: Path, fmt: str = DEFAULT_STICKER) -> BoxResult:
+    """Довести число грузомест поставки до k (None — не менять, только
+    перепечатать) и получить их стикеры."""
+    raw = check_open(client, supply_id)
+    if raw.get("isPickupPointShipmentAllowed") is False:
+        raise ValueError(f"Поставку {supply_id} нельзя сдать в ПВЗ — грузоместа "
+                         f"нужны только для ПВЗ, сдавайте её на СЦ/склад WB")
+    units = len(client.get_supply_order_ids(supply_id))
+    res = BoxResult(supply_id, units)
+    if k is not None and not 1 <= k <= max_boxes(units):
+        raise ValueError(f"Грузомест можно от 1 до {max_boxes(units)} "
+                         f"(в поставке {units} шт)")
+    existing = client.list_trbx(supply_id)
+    if k is not None and k > len(existing):
+        try:
+            res.created = client.add_trbx(supply_id, k - len(existing))
+        except WBApiError as e:
+            if 400 <= e.status_code < 500 and e.status_code not in (401, 403, 429):
+                # Спецификация не говорит, нужны ли до грузомест параметры
+                # отгрузки (ПВЗ) — если WB откажет, объясняем, а не падаем молча.
+                raise ValueError(
+                    f"WB не дал создать грузоместа ({e}). Возможно, сначала "
+                    f"нужно указать ПВЗ/параметры отгрузки поставки в кабинете WB "
+                    f"или число мест больше допустимого.") from e
+            raise
+    elif k is not None and k < len(existing):
+        res.deleted = existing[k:]
+        client.delete_trbx(supply_id, res.deleted)
+    res.trbx_ids = client.list_trbx(supply_id)
+    if not res.trbx_ids:
+        return res
+    try:
+        stickers = client.get_trbx_stickers(supply_id, res.trbx_ids, fmt)
+        res.stickers_path = _write_stickers(
+            [s.get("file") or "" for s in stickers], fmt,
+            out_dir / f"boxes_{supply_id}")
+    except Exception as e:
+        logging.exception("Box stickers for %s failed", supply_id)
+        res.stickers_error = str(e)
+    return res
+
+
+# ----------------------------------------------------------------------
+# Google Drive (общий диск) — своя копия, своя папка GDRIVE_FBS_WB_FOLDER_ID
+# ----------------------------------------------------------------------
+class DriveUploader:
+    """Минимальный клиент Drive v3 поверх requests.
+
+    Сервисный аккаунт не имеет своей квоты — файлы можно класть только
+    на ОБЩИЙ диск (Shared Drive), куда SA добавлен «Менеджером контента».
+    """
+
+    def __init__(self, creds_path: str):
+        from oauth2client.service_account import ServiceAccountCredentials
+        self.creds = ServiceAccountCredentials.from_json_keyfile_name(
+            creds_path, ["https://www.googleapis.com/auth/drive"])
+        self.session = requests.Session()
+
+    def _headers(self) -> dict:
+        return {"Authorization": f"Bearer {self.creds.get_access_token().access_token}"}
+
+    def _find(self, parent_id: str, name: str, mime: str | None = None) -> str | None:
+        safe = name.replace("\\", "\\\\").replace("'", "\\'")
+        q = f"'{parent_id}' in parents and name = '{safe}' and trashed = false"
+        if mime:
+            q += f" and mimeType = '{mime}'"
+        resp = self.session.get(f"{DRIVE_API}/files", headers=self._headers(),
+                                params={"q": q, "fields": "files(id)",
+                                        "supportsAllDrives": "true",
+                                        "includeItemsFromAllDrives": "true",
+                                        "corpora": "allDrives"},
+                                timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        files = resp.json().get("files", [])
+        return files[0]["id"] if files else None
+
+    def ensure_folder(self, parent_id: str, name: str) -> str:
+        found = self._find(parent_id, name, DRIVE_FOLDER_MIME)
+        if found:
+            return found
+        resp = self.session.post(
+            f"{DRIVE_API}/files", headers=self._headers(),
+            params={"supportsAllDrives": "true", "fields": "id"},
+            json={"name": name, "mimeType": DRIVE_FOLDER_MIME, "parents": [parent_id]},
+            timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+    def upload(self, parent_id: str, path: Path) -> str:
+        """Загружает файл; если с таким именем уже есть — заменяет содержимое."""
+        mime = "application/pdf" if path.suffix == ".pdf" else "text/plain"
+        content = path.read_bytes()
+        existing = self._find(parent_id, path.name)
+        if existing:
+            resp = self.session.patch(
+                f"{DRIVE_UPLOAD_API}/files/{existing}",
+                headers={**self._headers(), "Content-Type": mime},
+                params={"uploadType": "media", "supportsAllDrives": "true",
+                        "fields": "id"},
+                data=content, timeout=120)
+        else:
+            boundary = "fbs-wb-upload-boundary"
+            meta = json.dumps({"name": path.name, "parents": [parent_id]})
+            body = (f"--{boundary}\r\nContent-Type: application/json; "
+                    f"charset=UTF-8\r\n\r\n{meta}\r\n--{boundary}\r\n"
+                    f"Content-Type: {mime}\r\n\r\n").encode() + content + \
+                f"\r\n--{boundary}--".encode()
+            resp = self.session.post(
+                f"{DRIVE_UPLOAD_API}/files",
+                headers={**self._headers(),
+                         "Content-Type": f"multipart/related; boundary={boundary}"},
+                params={"uploadType": "multipart", "supportsAllDrives": "true",
+                        "fields": "id"},
+                data=body, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["id"]
+
+
+def upload_to_drive(paths: list[Path]) -> tuple[str, str]:
+    """→ (url папки дня, ошибка). Не бросает."""
+    root = os.environ.get("GDRIVE_FBS_WB_FOLDER_ID", "").strip()
+    if not root:
+        return "", "GDRIVE_FBS_WB_FOLDER_ID не задан — на Drive не выкладывали"
+    try:
+        up = DriveUploader(os.environ.get("GOOGLE_CREDS",
+                                          "/opt/openclaw/secrets/gcp-sa.json"))
+        folder = up.ensure_folder(root, now_local().date().isoformat())
+        for p in paths:
+            up.upload(folder, p)
+        return f"https://drive.google.com/drive/folders/{folder}", ""
+    except Exception as e:
+        logging.exception("Drive upload failed")
+        msg = str(e)
+        if "storageQuotaExceeded" in msg or "403" in msg:
+            msg += (" — папка должна быть на ОБЩЕМ диске, SA добавлен "
+                    "«Менеджером контента»")
+        return "", msg
+
+
+# ----------------------------------------------------------------------
 # Текст для Telegram
 # ----------------------------------------------------------------------
 def format_summary(plan: WbPlan, max_skus: int = 25) -> str:
@@ -810,6 +1269,62 @@ def format_choice(exc: WarehouseChoiceNeeded) -> str:
     lines = [f"🏬 <b>FBS WB</b>: {_html.escape(str(exc))}"]
     for w, n in exc.options:
         lines.append(f"• {_html.escape(w.name)} (ID {w.id}) — {n} зад.")
+    return "\n".join(lines)
+
+
+def format_take(res: TakeResult, plan: WbPlan, docs: list[SupplyDocs]) -> str:
+    """Итог «Собрать поставку» (без вопроса про грузоместа — он отдельно)."""
+    import html as _html
+    wh = _html.escape(plan.warehouse.name)
+    lines = [f"📦 <b>FBS WB · склад «{wh}»</b>"]
+    if res.created:
+        lines.append(f"Создана поставка: {', '.join(res.created)}")
+    lines.append(f"Добавлено заданий: <b>{res.added_total}</b>")
+    if res.failed:
+        lines.append(f"❌ Не добавлены: {len(res.failed)}")
+        for oid, err in res.failed[:10]:
+            lines.append(f"• {oid}: <code>{_html.escape(err)[:200]}</code>")
+    for d in docs:
+        if d.stickers_error:
+            lines.append(f"⚠️ {d.supply_id}: стикеры не получены — "
+                         f"<code>{_html.escape(d.stickers_error)[:300]}</code>")
+        elif d.missing_stickers:
+            lines.append(f"⚠️ {d.supply_id}: нет стикеров для "
+                         f"{', '.join(map(str, d.missing_stickers[:10]))}")
+    if not docs:
+        lines.append("Открытых поставок с заданиями нет.")
+    warn = [w for w in plan.warnings if w.startswith(("🏷", "❌", "🏬"))]
+    if warn:
+        lines += [""] + [_html.escape(w) for w in warn]
+    return "\n".join(lines)
+
+
+def format_box_prompt(d: SupplyDocs, existing: int) -> str:
+    import html as _html
+    name = f" «{_html.escape(d.name)}»" if d.name else ""
+    lines = [f"✅ Поставка <b>{d.supply_id}</b>{name}: сейчас <b>{d.units} шт</b> "
+             f"({d.units} зад.)"]
+    if not d.pp_allowed:
+        lines.append("🏬 Не для ПВЗ — сдавать на СЦ/склад WB, грузоместа не нужны.")
+    elif existing:
+        lines.append(f"Грузомест уже: <b>{existing}</b>. Перепечатать или изменить число?")
+    else:
+        lines.append(f"Сколько грузомест? (от 1 до {max_boxes(d.units)})")
+    return "\n".join(lines)
+
+
+def format_boxes(res: BoxResult) -> str:
+    import html as _html
+    lines = [f"📦 <b>{res.supply_id}</b>: {res.units} шт, грузомест "
+             f"<b>{len(res.trbx_ids)}</b>"]
+    if res.created:
+        lines.append(f"Создано: {len(res.created)}")
+    if res.deleted:
+        lines.append(f"Удалено: {len(res.deleted)} — их старые стикеры НЕ клеить")
+    if res.stickers_error:
+        lines.append(f"⚠️ Стикеры мест не получены: "
+                     f"<code>{_html.escape(res.stickers_error)[:300]}</code>")
+    lines.append("Дальше — сдать поставку в ПВЗ (этап 3, пока в кабинете WB).")
     return "\n".join(lines)
 
 
@@ -859,8 +1374,20 @@ def overview_from_fixture(path: Path) -> WbOverview:
 
 def main():
     p = argparse.ArgumentParser(
-        description="FBS WB: сводка и лист сборки по складу (этап 1, только чтение)")
+        description="FBS WB: сводка, лист сборки; --take/--boxes — запись в WB")
     p.add_argument("--warehouse", "-w", help="ID склада или часть названия")
+    p.add_argument("--take", action="store_true",
+                   help="ЗАПИСЬ: собрать новые задания склада в поставку + документы")
+    p.add_argument("--mode", choices=SUPPLY_MODES,
+                   default=os.environ.get("FBS_WB_SUPPLY_MODE", "auto"))
+    p.add_argument("--supply", default="", help="С --take: всё в эту поставку WB-GI-…")
+    p.add_argument("--boxes", metavar="WB-GI-…:K",
+                   help="ЗАПИСЬ: довести число грузомест поставки до K (K=0 — "
+                        "не менять, только стикеры)")
+    p.add_argument("--sticker", choices=STICKER_FORMATS,
+                   default=os.environ.get("FBS_WB_STICKER", DEFAULT_STICKER))
+    p.add_argument("--no-drive", action="store_true",
+                   help="Не выкладывать документы на Google Drive")
     p.add_argument("--out", default="fbs_wb_out", help="Куда сохранить PDF")
     p.add_argument("--list-warehouses", action="store_true",
                    help="Показать склады и число заданий на них")
@@ -880,6 +1407,35 @@ def main():
             ids = [int(x) for x in args.explain.replace(" ", "").split(",") if x]
             print("\n".join(explain_orders(make_client(), ids)))
             sys.exit(0)
+
+        out = Path(args.out)
+        if args.boxes:
+            sid, _, k = args.boxes.partition(":")
+            res = set_boxes(make_client(), sid.strip().upper(),
+                            int(k) or None if k else None, out, args.sticker)
+            print(format_boxes(res))
+            if res.stickers_path:
+                logging.info("Box stickers: %s", res.stickers_path)
+                if not args.no_drive:
+                    url, err = upload_to_drive([res.stickers_path])
+                    logging.info("Drive: %s", url or err)
+            sys.exit(1 if res.stickers_error else 0)
+
+        if args.take:
+            res, plan, docs = collect_supplies(
+                make_client(), args.warehouse, args.mode, args.supply.upper(),
+                args.sticker, out)
+            print(format_take(res, plan, docs))
+            paths = []
+            for d in docs:
+                paths += [p for p in (d.picking_path, d.stickers_path) if p]
+                print(f"{d.supply_id}: {d.units} шт → грузоместа: "
+                      f"--boxes {d.supply_id}:K (K ≤ {max_boxes(d.units)})")
+            logging.info("Files: %s", ", ".join(map(str, paths)))
+            if paths and not args.no_drive:
+                url, err = upload_to_drive(paths)
+                logging.info("Drive: %s", url or err)
+            sys.exit(1 if res.failed or any(d.stickers_error for d in docs) else 0)
 
         ov = (overview_from_fixture(Path(args.fixture)) if args.fixture
               else load_overview(make_client()))
@@ -901,11 +1457,14 @@ def main():
         plan = build_plan(ov, wh)
         print(format_summary(plan))
         if plan.orders:
-            pdf = build_picking_pdf(plan, Path(args.out) / picking_filename(plan))
+            pdf = build_picking_pdf(plan, out / picking_filename(plan))
             logging.info("Picking list: %s", pdf)
     except KeyError as e:
         logging.error("Missing env var: %s", e)
         sys.exit(1)
+    except (ValueError, SupplyClosed, WarehouseChoiceNeeded) as e:
+        logging.error("%s", e)
+        sys.exit(2)
     except Exception:
         logging.exception("FBS WB failed")
         sys.exit(1)
