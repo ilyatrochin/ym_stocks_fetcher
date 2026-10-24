@@ -62,7 +62,7 @@ import re
 import sys
 import time
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
@@ -114,6 +114,7 @@ DEFAULT_CITY = "Москва"       # город ПВЗ, если не зада�
 SHIPPING_TYPE = "selfShipping"  # везём сами (DESIGN_FBS_WB.md §4.1)
 ORDERS_LOOKBACK_DAYS = 30     # глубина поиска деталей заданий из открытых поставок
 ORDERS_MAX_LOOKBACK_DAYS = 89 # /orders с 06.08.2026 отдаёт только 3 месяца
+ORDERS_WINDOW_DAYS = 29       # /orders: «максимум 30 календарных дней одним запросом»
 
 # Статусы проверки маркировки, с которыми поставку МОЖНО передать в доставку.
 # Всё остальное (required, pending, *Invalid*, *NotFound* …) — блокирует.
@@ -398,12 +399,15 @@ class WBFbsClient:
     def get_new_orders(self) -> list[dict]:
         return self._request("GET", ORDERS_NEW_ENDPOINT).get("orders") or []
 
-    def iter_orders(self, date_from: datetime) -> Iterator[dict]:
+    def iter_orders(self, date_from: datetime, date_to: datetime) -> Iterator[dict]:
+        """Задания, созданные в [date_from, date_to]; период ≤ 30 дней —
+        иначе WB молча режет его (свежие задания не приходят)."""
         nxt = 0
         while True:
             data = self._request("GET", ORDERS_ENDPOINT, params={
                 "limit": PAGE_LIMIT, "next": nxt,
-                "dateFrom": int(date_from.timestamp())})
+                "dateFrom": int(date_from.timestamp()),
+                "dateTo": int(date_to.timestamp())})
             orders = data.get("orders") or []
             yield from orders
             nxt = data.get("next") or 0
@@ -598,7 +602,21 @@ def _parse_ts(value: str) -> datetime | None:
 # ----------------------------------------------------------------------
 # Загрузка и план
 # ----------------------------------------------------------------------
-def load_overview(client: WBFbsClient) -> WbOverview:
+def iter_orders_since(client: WBFbsClient, date_from: datetime,
+                      until: datetime | None = None) -> Iterator[dict]:
+    """/orders окнами по ORDERS_WINDOW_DAYS — от сейчас назад до date_from
+    (свежие — первыми: вызывающий может остановиться, найдя всё нужное)."""
+    end = until or datetime.now(timezone.utc) + timedelta(minutes=5)
+    while end > date_from:
+        start = max(date_from, end - timedelta(days=ORDERS_WINDOW_DAYS))
+        yield from client.iter_orders(start, end)
+        end = start
+
+
+def load_overview(client: WBFbsClient,
+                  known: dict[int, WbOrder] | None = None) -> WbOverview:
+    """known — задания, детали которых уже есть (только что взятые в поставку):
+    подстраховка, если /orders их ещё не отдаёт."""
     new_orders = [parse_order(o) for o in client.get_new_orders()]
     warnings: list[str] = []
     try:
@@ -628,10 +646,16 @@ def load_overview(client: WBFbsClient) -> WbOverview:
         date_from = max(date_from - timedelta(days=1),
                         now - timedelta(days=ORDERS_MAX_LOOKBACK_DAYS))
         found: dict[int, WbOrder] = {}
-        for raw in client.iter_orders(date_from):
+        for raw in iter_orders_since(client, date_from):
             oid = int(raw.get("id") or 0)
             if oid in wanted:
                 found[oid] = parse_order(raw)
+                if len(found) == len(wanted):
+                    break
+        for oid in set(wanted) - set(found):
+            if known and oid in known:
+                k = known[oid]
+                found[oid] = replace(k)
         for oid, o in found.items():
             sup = wanted[oid]
             o.supply_id = sup.supply_id
@@ -641,9 +665,10 @@ def load_overview(client: WBFbsClient) -> WbOverview:
             in_assembly.append(o)
         missing = set(wanted) - set(found)
         if missing:
+            sids = sorted({wanted[oid].supply_id for oid in missing})
             warnings.append(
-                f"ℹ️ {len(missing)} задани(й) из открытых поставок не найдены "
-                f"в /orders (старше {ORDERS_MAX_LOOKBACK_DAYS} дн.?): "
+                f"ℹ️ {len(missing)} задани(й) из открытых поставок "
+                f"{', '.join(sids[:5])} не найдены в /orders — их нет в листе: "
                 f"{', '.join(map(str, sorted(missing)[:10]))}")
 
     # Статусы — и для новых: покупатель мог отменить заказ после /orders/new.
@@ -1144,7 +1169,8 @@ def collect_supplies(client: WBFbsClient, warehouse_ref: str | None,
     по каждой открытой поставке склада."""
     plan = load_plan(client, warehouse_ref)
     res = take_into_supplies(client, plan, mode, supply_id)
-    fresh = build_plan(load_overview(client), plan.warehouse)
+    fresh = build_plan(load_overview(client, {o.order_id: o for o in plan.orders}),
+                       plan.warehouse)
     docs = [make_supply_docs(client, fresh, s.supply_id, out_dir, fmt)
             for s in fresh.supplies if fresh.for_supply(s.supply_id).orders]
     return res, fresh, docs
