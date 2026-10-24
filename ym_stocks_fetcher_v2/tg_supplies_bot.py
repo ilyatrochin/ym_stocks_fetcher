@@ -10,6 +10,8 @@ tg_supplies_bot.py — Telegram-бот для управления постав�
               пересчитать прогноз. Дольше, но данные свежие.
   /fbs      — FBS-отгрузка на сегодня: лист сборки + ярлыки PDF, Google Drive,
               кнопка «Собрано» (см. fbs_bot_handlers.py / fbs_shipment.py)
+  /fbs_wb   — FBS Wildberries по складу (fbs_wb_bot.py / fbs_wb.py);
+              подключается, только если задан WB_API_TOKEN
 
 Inline-кнопки (только для запланированных заявок):
   [📦 #12345 — упаковать]   → помечает заявку как упакованную
@@ -529,6 +531,13 @@ def main():
     app.add_handler(CommandHandler("refresh", cmd_refresh))
     app.add_handler(CallbackQueryHandler(callback_pack, pattern=r"^(pack|unpack):"))
     register_fbs_handlers(app, is_allowed=_is_allowed)
+    if os.environ.get("WB_API_TOKEN", "").strip():
+        # FBS WB — отдельный модуль; его поломка не должна ронять бота.
+        try:
+            from fbs_wb_bot import register_fbs_wb_handlers
+            register_fbs_wb_handlers(app, is_allowed=_is_allowed)
+        except Exception:
+            logging.exception("FBS WB handlers not loaded")
 
     logging.info("Бот запущен, polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
