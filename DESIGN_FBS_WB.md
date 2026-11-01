@@ -302,6 +302,9 @@ GDRIVE_FBS_WB_FOLDER_ID=<папка WB на общем диске>   # отде�
 FBS_WB_SUPPLY_MODE=auto            # auto | new
 FBS_WB_WAREHOUSE=                  # склад по умолчанию; пусто = спросить кнопками, если складов с заданиями >1
 FBS_WB_STICKER=58x40               # 58x40 (по умолчанию) | 40x30 | zpl
+FBS_WB_STICKER_GOODS=1             # 1 = PDF как из кабинета (этикетка товара + стикер); 0 = только стикеры
+WB_CONTENT_TOKEN=                  # если у WB_API_TOKEN нет категории «Контент»
+FBS_WB_SELLER_NAME=                # продавец на этикетке; пусто = /api/v1/seller-info
 FBS_WB_SHIPPING_TYPE=selfShipping  # по умолчанию сами; transportCompany — этап 3.1 (ЭТрН)
 FBS_WB_SHIPPING_POINT="Москва, проспект Лихачёва, 22"   # адрес ПВЗ или его ID (цифры)
 FBS_WB_CITY=                       # город поиска ПВЗ; пусто = из адреса, иначе Москва

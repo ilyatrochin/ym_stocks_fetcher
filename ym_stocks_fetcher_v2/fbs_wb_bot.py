@@ -380,8 +380,7 @@ def register_fbs_wb_handlers(app: Application,
                 for d in docs:
                     if d.stickers_path:
                         files.append((d.stickers_path,
-                                      f"🏷 Стикеры заданий {d.supply_id} — {d.units} шт "
-                                      f"(в порядке листа)"))
+                                      f"🏷 Этикетки и стикеры {d.supply_id} — {d.units} шт"))
                     files.append((d.picking_path, f"📋 Лист сборки {d.supply_id}"))
                     paths += [p for p in (d.stickers_path, d.picking_path) if p]
                 await _send_files(context.bot, chat_id, files)

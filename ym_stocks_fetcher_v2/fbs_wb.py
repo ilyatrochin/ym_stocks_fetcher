@@ -21,7 +21,9 @@ DESIGN_FBS_WB.md.
    поставка (auto) или новая (POST /api/v3/supplies), задания добавляются
    PATCH /api/marketplace/v3/supplies/{id}/orders (по 100) → статус confirm.
 6. Документы поставки: стикеры заданий (POST /api/v3/orders/stickers,
-   PNG 58×40 → PDF в порядке листа) + лист сборки → Google Drive
+   PNG 58×40 → PDF как из кабинета WB: титульный ярлык, «N шт.» по товару,
+   пары этикетка товара + стикер; товар — карточки, токен «Контент»)
+   + лист сборки → Google Drive
    (GDRIVE_FBS_WB_FOLDER_ID/YYYY-MM-DD/, своя папка, не YM).
 7. set_boxes() — грузоместа: довести число до K (POST/DELETE …/trbx) и
    стикеры мест (POST …/trbx/stickers). K спрашивается у человека.
@@ -91,6 +93,12 @@ SHIPPING_POINTS_ENDPOINT = "/api/marketplace/v3/fbs/supplies/{supply_id}/shippin
 SHIPPING_METHOD_ENDPOINT = "/api/marketplace/v3/fbs/supplies/shipping-method"
 DELIVER_ENDPOINT = "/api/v3/supplies/{supply_id}/deliver"
 SUPPLY_BARCODE_ENDPOINT = "/api/v3/supplies/{supply_id}/barcode"
+
+CONTENT_API_BASE = "https://content-api.wildberries.ru"
+SANDBOX_CONTENT_API_BASE = "https://content-api-sandbox.wildberries.ru"
+CARDS_ENDPOINT = "/content/v2/get/cards/list"
+SELLER_INFO_URL = "https://common-api.wildberries.ru/api/v1/seller-info"
+CARDS_INTERVAL = 0.6          # лимит карточек: 100 запросов/мин, интервал 600 мс
 
 DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
@@ -356,7 +364,7 @@ class WBFbsClient:
         self._last_call = time.monotonic()
 
     def _request(self, method: str, path: str, **kwargs):
-        url = f"{self.base_url}{path}"
+        url = path if path.startswith("https://") else f"{self.base_url}{path}"
         last_err = None
         for attempt in range(MAX_RETRIES):
             self._throttle()
@@ -503,6 +511,26 @@ class WBFbsClient:
             params={"type": "zplh" if fmt == "zpl" else "png"},
             json={"trbxIds": trbx_ids})
         return list(data.get("stickers") or [])
+
+    # --- товар и продавец (для этикеток) ------------------------------
+    def find_card(self, nm_id: int) -> dict | None:
+        """Карточка по артикулу WB. Токен с категорией «Контент»."""
+        base = (SANDBOX_CONTENT_API_BASE if self.base_url == SANDBOX_API_BASE
+                else CONTENT_API_BASE)
+        token = os.environ.get("WB_CONTENT_TOKEN", "").strip()
+        data = self._request(
+            "POST", base + CARDS_ENDPOINT,
+            headers={"Authorization": token} if token else None,
+            json={"settings": {"cursor": {"limit": 100}, "filter": {
+                "textSearch": str(nm_id), "withPhoto": -1}}})
+        return next((c for c in data.get("cards") or []
+                     if c.get("nmID") == nm_id), None)
+
+    def get_seller_name(self) -> str:
+        # Без _request: при лимите «1 запрос в сутки» ждать 429 нельзя.
+        resp = self.session.get(SELLER_INFO_URL, timeout=HTTP_TIMEOUT)
+        resp.raise_for_status()
+        return str(resp.json().get("name") or "")
 
     # --- сдача в ПВЗ (этап 3) -----------------------------------------
     def get_shipping_points(self, supply_id: str, city: str, office_type: str,
@@ -997,6 +1025,7 @@ class SupplyDocs:
     stickers_error: str = ""
     missing_stickers: list[int] = field(default_factory=list)
     pp_allowed: bool = True    # False — сдавать на СЦ/склад, грузоместа не нужны
+    goods_warning: str = ""    # не удалось получить название/бренд и т.п.
 
 
 @dataclass
@@ -1008,6 +1037,74 @@ class BoxResult:
     deleted: list[str] = field(default_factory=list)
     stickers_path: Path | None = None
     stickers_error: str = ""
+
+
+@dataclass
+class WbCard:
+    """Из карточки товара — для этикетки."""
+    title: str
+    brand: str
+    color: str
+    sizes: dict[str, str]      # баркод → размер
+
+    def size(self, barcode: str) -> str:
+        if barcode in self.sizes:
+            return self.sizes[barcode]
+        vals = set(self.sizes.values())
+        return vals.pop() if len(vals) == 1 else ""
+
+
+def parse_card(raw: dict) -> WbCard:
+    color = ""
+    for ch in raw.get("characteristics") or []:
+        if ch.get("name") == "Цвет":
+            v = ch.get("value")
+            color = ", ".join(map(str, v)) if isinstance(v, list) else str(v or "")
+    sizes = {str(sku): str(sz.get("techSize") or "")
+             for sz in raw.get("sizes") or [] for sku in sz.get("skus") or []}
+    return WbCard(str(raw.get("title") or ""), str(raw.get("brand") or ""),
+                  color, sizes)
+
+
+def load_cards(client: WBFbsClient, nm_ids: list[int]) -> tuple[dict[int, WbCard], str]:
+    """(nmId → карточка, предупреждение). Ошибка не мешает стикерам."""
+    cards: dict[int, WbCard] = {}
+    try:
+        for i, nm in enumerate(nm_ids):
+            if i:
+                time.sleep(CARDS_INTERVAL)
+            raw = client.find_card(nm)
+            if raw:
+                cards[nm] = parse_card(raw)
+    except WBApiError as e:
+        logging.warning("Cards lookup failed: %s", e)
+        if e.status_code in (401, 403):
+            return cards, ("Нет доступа к карточкам товаров: токену нужна категория "
+                           "«Контент» (WB_API_TOKEN или WB_CONTENT_TOKEN)")
+        return cards, f"Карточки товаров не получены: {e}"
+    except Exception as e:
+        logging.warning("Cards lookup failed: %s", e)
+        return cards, f"Карточки товаров не получены: {e}"
+    lost = [nm for nm in nm_ids if nm not in cards]
+    return cards, f"Нет карточек для артикулов WB: {', '.join(map(str, lost[:10]))}" if lost else ""
+
+
+_seller_cache = ""
+
+
+def seller_name(client: WBFbsClient) -> str:
+    """FBS_WB_SELLER_NAME, иначе /seller-info (лимит вплоть до 1 запроса в
+    сутки — запоминаем на время работы процесса)."""
+    global _seller_cache
+    env = os.environ.get("FBS_WB_SELLER_NAME", "").strip()
+    if env:
+        return env
+    if not _seller_cache:
+        try:
+            _seller_cache = client.get_seller_name()
+        except Exception as e:
+            logging.warning("Seller info failed: %s", e)
+    return _seller_cache
 
 
 def supply_name(warehouse: WbWarehouse) -> str:
@@ -1132,6 +1229,115 @@ def _write_stickers(files: list[str], fmt: str, path_stem: Path) -> Path:
     return images_pdf(blobs, fmt, path_stem.with_suffix(".pdf"))
 
 
+# Ярлыки «как в кабинете»: титульный, по товару «N шт.», затем пары
+# этикетка товара + стикер WB.
+def _text_block(c, rows: list[tuple[str, str]], x: float, width: float,
+                top: float, bottom: float, fonts: tuple[str, str],
+                sizes: tuple[float, ...], center: bool = False) -> None:
+    """rows: (подпись обычным, значение жирным). Без подписи значение
+    переносится; шрифт уменьшается, пока всё не войдёт в [bottom, top]."""
+    from reportlab.lib.utils import simpleSplit
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+
+    font, bold = fonts
+    for fs in sizes:
+        lines: list[tuple[str, str]] = []
+        for label, value in rows:
+            if label:
+                room = width - stringWidth(label, font, fs)
+                lines.append((label, (simpleSplit(value, bold, fs, room) or [""])[0]))
+            else:
+                lines += [("", v) for v in simpleSplit(value, bold, fs, width) or [""]]
+        if len(lines) * fs * 1.2 <= top - bottom:
+            break
+    lines = lines[:int((top - bottom) / (fs * 1.2))]
+    y = top - fs
+    for label, value in lines:
+        cur = x
+        if center:
+            cur += (width - stringWidth(label, font, fs)
+                    - stringWidth(value, bold, fs)) / 2
+        c.setFont(font, fs)
+        c.drawString(cur, y, label)
+        c.setFont(bold, fs)
+        c.drawString(cur + stringWidth(label, font, fs), y, value)
+        y -= fs * 1.2
+
+
+def _goods_rows(o: WbOrder, card: WbCard | None) -> list[tuple[str, str]]:
+    rows = []
+    if card:
+        rows.append(("", card.title))
+        rows += [(k, v) for k, v in (("Бренд: ", card.brand),
+                                     ("Цвет: ", card.color),
+                                     ("Размер: ", card.size(o.barcode))) if v]
+    return rows
+
+
+def sticker_pack_pdf(items: list[tuple[WbOrder, bytes]], cards: dict[int, WbCard],
+                     seller: str, supply_title: str, fmt: str, path: Path) -> Path:
+    """items — (задание, PNG стикера WB). Формат — как PDF из кабинета WB."""
+    from reportlab.graphics.barcode.code128 import Code128
+    from reportlab.lib.units import mm
+    from reportlab.lib.utils import ImageReader
+    from reportlab.pdfgen import canvas
+
+    fonts = _register_fonts()
+    w, h = (int(x) * mm for x in fmt.split("x"))
+    k = h / (30 * mm)            # размеры заданы для высоты 30 мм, 58×40 — крупнее
+    margin = 2 * mm
+    box = w - 2 * margin
+    sizes = tuple(x * k for x in (6, 5.5, 5, 4.5, 4))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    c = canvas.Canvas(str(path), pagesize=(w, h))
+
+    groups: dict[tuple[str, str], list[tuple[WbOrder, bytes]]] = defaultdict(list)
+    for o, img in items:
+        groups[(o.article, o.barcode)].append((o, img))
+
+    _text_block(c, [("", f"{now_local():%d.%m.%Y}"), ("", " "), ("Поставка:", ""),
+                    ("", supply_title), ("", " "),
+                    ("Товаров итого: ", str(len(items))),
+                    ("Артикулов итого: ", str(len(groups)))],
+                margin, box, h - margin, margin, fonts,
+                tuple(x * k for x in (8, 7, 6, 5)))
+    c.showPage()
+
+    for (article, barcode), pairs in sorted(groups.items()):
+        o0 = pairs[0][0]
+        card = cards.get(o0.nm_id)
+        c.setFont(fonts[1], 14 * k)
+        c.drawString(margin, h - margin - 13 * k, f"{len(pairs)} шт.")
+        _text_block(c, _goods_rows(o0, card) + [
+            ("", " "), ("Артикул WB: ", str(o0.nm_id or "—")),
+            ("Баркод: ", barcode or "—"), ("Артикул:", ""), ("", article)],
+            margin, box, h - margin - 18 * k, margin, fonts, sizes)
+        c.showPage()
+        # В группе по окончанию номера стикера — так разложены стикеры в кабинете.
+        for o, img in sorted(pairs, key=lambda p: p[0].sticker.split()[-1:]):
+            top = h - 1.5 * mm
+            if barcode:
+                bar_h = 7 * mm * k
+                bar = Code128(barcode, barWidth=0.25 * mm, barHeight=bar_h, quiet=False)
+                if bar.width > box:
+                    bar = Code128(barcode, barWidth=0.25 * mm * box / bar.width,
+                                  barHeight=bar_h, quiet=False)
+                bar.drawOn(c, (w - bar.width) / 2, top - bar_h)
+                top -= bar_h + 6.5 * k
+                c.setFont(fonts[0], 5.5 * k)
+                c.drawCentredString(w / 2, top, barcode)
+                top -= 2 * k
+            rows = ([(seller, "")] if seller else []) + _goods_rows(o, card) + [
+                ("Артикул:", ""), ("", article)]
+            _text_block(c, rows, margin, box, top, 1 * mm, fonts, sizes, center=True)
+            c.showPage()
+            c.drawImage(ImageReader(io.BytesIO(img)), 0, 0, width=w, height=h,
+                        preserveAspectRatio=True, anchor="c")
+            c.showPage()
+    c.save()
+    return path
+
+
 def make_supply_docs(client: WBFbsClient, plan: WbPlan, supply_id: str,
                      out_dir: Path, fmt: str = DEFAULT_STICKER) -> SupplyDocs:
     """Стикеры заданий (в порядке листа) + лист сборки одной поставки."""
@@ -1143,7 +1349,7 @@ def make_supply_docs(client: WBFbsClient, plan: WbPlan, supply_id: str,
     if orders:
         try:
             got = client.get_stickers([o.order_id for o in orders], fmt)
-            files = []
+            files, items = [], []
             for o in orders:
                 s = got.get(o.order_id)
                 if not s:
@@ -1151,7 +1357,16 @@ def make_supply_docs(client: WBFbsClient, plan: WbPlan, supply_id: str,
                     continue
                 o.sticker = f"{s.get('partA', '')} {s.get('partB', '')}".strip()
                 files.append(s.get("file") or "")
-            if files:
+                items.append(o)
+            if files and fmt != "zpl" and \
+                    os.environ.get("FBS_WB_STICKER_GOODS", "1").strip() != "0":
+                cards, docs.goods_warning = load_cards(
+                    client, sorted({o.nm_id for o in items if o.nm_id}))
+                docs.stickers_path = sticker_pack_pdf(
+                    list(zip(items, map(_decode_sticker, files))), cards,
+                    seller_name(client), name or supply_id, fmt,
+                    out_dir / f"stickers_{supply_id}.pdf")
+            elif files:
                 docs.stickers_path = _write_stickers(
                     files, fmt, out_dir / f"stickers_{supply_id}")
         except Exception as e:
@@ -1666,7 +1881,10 @@ def format_take(res: TakeResult, plan: WbPlan, docs: list[SupplyDocs]) -> str:
         if d.stickers_error:
             lines.append(f"⚠️ {d.supply_id}: стикеры не получены — "
                          f"<code>{_html.escape(d.stickers_error)[:300]}</code>")
-        elif d.missing_stickers:
+        if d.goods_warning:
+            lines.append(f"⚠️ {d.supply_id}: этикетки без названия — "
+                         f"{_html.escape(d.goods_warning)[:300]}")
+        if d.missing_stickers:
             lines.append(f"⚠️ {d.supply_id}: нет стикеров для "
                          f"{', '.join(map(str, d.missing_stickers[:10]))}")
     if not docs:
