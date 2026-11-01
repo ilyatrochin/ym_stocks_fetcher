@@ -119,6 +119,8 @@ sudo systemctl restart ym-supplies-bot
    TG_ALLOWED_USERS=<user_id через запятую>   # ОБЯЗАТЕЛЬНО: без него запись запрещена
    # FBS_WB_SUPPLY_MODE=auto                  # auto | new
    # FBS_WB_STICKER=58x40                     # 58x40 | 40x30 | zpl
+   # FBS_WB_SELLER_NAME=ИП …                  # продавец на этикетке (иначе из /seller-info)
+   # WB_CONTENT_TOKEN=<токен>                 # если у WB_API_TOKEN нет категории «Контент»
    ```
 3. **Первая проверка — в песочнице WB** (`WB_SANDBOX=1`, токен песочницы), затем на одном
    реальном задании:
